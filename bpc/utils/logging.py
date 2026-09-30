@@ -25,6 +25,10 @@ def _diag_to_np(diag) -> Dict[str, np.ndarray]:
     return out
 
 
+#: Public alias used by the VBPC logger to serialize any diagnostics namedtuple.
+diag_to_np = _diag_to_np
+
+
 class RunLogger:
     """Pure-Python logger for one training run."""
 

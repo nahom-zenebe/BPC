@@ -93,17 +93,33 @@ def _parse_scalar(value: str) -> Any:
         return value
 
 
+def load_config_with_presets(
+    path: str,
+    default_cfg,
+    presets: Dict[str, object],
+    preset_override: Optional[str] = None,
+) -> Tuple[object, LoggingConfig, Dict[str, Any]]:
+    """Generic YAML + preset loader shared by the BPC and VBPC entry points."""
+
+    raw = load_yaml_like(path)
+    preset = preset_override or raw.get("preset")
+    if preset:
+        if preset not in presets:
+            raise KeyError(f"Unknown preset={preset}; available presets: {sorted(presets)}")
+        cfg = presets[preset]
+    else:
+        cfg = default_cfg
+    cfg = _replace_known(cfg, raw.get("config", {}))
+    lcfg = _replace_known(LOGGING, raw.get("logging", {}))
+    return cfg, lcfg, raw
+
+
 def load_experiment_config(
     path: str,
     default_cfg: BPCConfig,
     preset_override: Optional[str] = None,
 ) -> Tuple[BPCConfig, LoggingConfig, Dict[str, Any]]:
-    raw = load_yaml_like(path)
-    preset = preset_override or raw.get("preset")
-    cfg = make_presets()[preset] if preset else default_cfg
-    cfg = _replace_known(cfg, raw.get("config", {}))
-    lcfg = _replace_known(LOGGING, raw.get("logging", {}))
-    return cfg, lcfg, raw
+    return load_config_with_presets(path, default_cfg, make_presets(), preset_override)
 
 
 def _replace_known(obj, values: Dict[str, Any]):
