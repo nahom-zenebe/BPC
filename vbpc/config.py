@@ -20,14 +20,64 @@ The proposal writes the two objective terms as unnormalized sums.
 literally (``L_PC = 0.5 * sum_l e_l^T Sigma_l^{-1} e_l`` and
 ``L_KL = 0.5 * sum(mu_W^2 + sigma_W^2 - 1 - log sigma_W^2)``).
 
-Because a raw weight sum scales with the number of weights (~1e5 for MNIST)
-while the raw PC energy scales with the number of examples/features, the two
-terms are not on a comparable scale and ``beta`` would only be meaningful over
-many orders of magnitude.  The defaults therefore use ``"mean"`` reductions
-(mean over batch and features for ``L_PC``, mean over weight entries for
-``L_KL``), which places ``beta`` on the interval swept by the proposal,
-``beta in [0, 0.001, 0.01, 0.1, 1.0]``.  The identity
+``"mean"`` divides ``L_PC`` by ``batch x features`` and ``L_KL`` by the number of
+weight entries, so both terms become *batch-size independent* averages and
+``beta`` is a genuine unitless trade-off between the data term and the prior.
+
+Why ``"mean"`` is the default, and what is *not* a valid argument for it
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The loss *values* under the two reductions are not comparable, but the
+*gradient norms* are what decide how much ``beta`` matters.  Measured at
+initialization on the two-moons preset (502 weights, ``n_train=1000``,
+8-sample average of the real training step):
+
+    reduction  batch   L_PC     L_KL     |grad_mu KL|/|grad_mu PC|
+                                               |grad_logsig KL|/|grad_logsig PC|
+    mean/mean  100     0.045    5.084    0.110                    8.40
+    mean/mean  1000    0.045    5.084    0.111                    8.37
+    sum/sum    100     64.8     1280.0   0.029                    1.83
+    sum/sum    1000    634.1    1280.0   0.003                    0.19
+
+Two consequences, both measured:
+
+* ``sum``/``sum`` only brings the two *losses* within ~2x at ``batch_size=1000``.
+  Because ``L_PC`` under ``"sum"`` grows linearly with the batch while ``L_KL``
+  does not, shrinking the batch (which is required to get more than one
+  optimizer step per epoch) makes ``sum``/``sum`` *worse*: at ``batch_size=100``
+  the losses are 19.8x apart and ``beta`` moves the weight gradient 4x less than
+  it does under ``"mean"``.  ``sum``/``sum`` also ties the effective learning
+  rate to the batch size.
+* Under ``"mean"`` the ``L_PC``/``L_KL`` *loss* ratio is ~110x, which looks
+  alarming, but the corresponding *gradient* ratio on the weight means is only
+  0.110 per unit ``beta``.  A loss ratio is therefore not evidence that
+  ``beta`` is inert: ``L_KL`` carries a large additive constant
+  (``-log sigma_W^2``, ~96% of its value at initialization) that contributes
+  almost no gradient.
+
+The previous version of this docstring claimed ``"mean"`` "places ``beta`` on
+the interval swept by the proposal, ``beta in [0, 0.001, 0.01, 0.1, 1.0]``".
+That claim does not follow from a loss ratio.  What does decide whether the
+sweep probes anything is the gradient ratio, so the run logs
+``pc_grad_norm`` / ``kl_grad_norm`` (see :mod:`vbpc.training.train_step`) and
+those should be read directly instead.  The identity
 ``L_total = L_PC + beta * L_KL`` holds for every reduction choice.
+
+Weight prior
+------------
+The prior is ``p(W_l) = N(0, tau^2 I)`` with ``tau = exp(prior_weight_log_sigma)``
+(``prior_weight_log_sigma = 0`` gives the proposal's standard normal
+``N(0, I)``).  It must be chosen consistently with ``init_weight_log_sigma``:
+a unit prior against a thin initialization makes
+``dKL/dlog_sigma = sigma^2 - tau^2 ~ -1``, which drives ``sigma_W`` up towards
+``1`` -- a 20x noise inflation relative to the ``sigma = exp(-3)`` start -- and
+once the run has more than a handful of steps (see ``batch_size`` below) that
+inflates the sampled weights enough to destroy the learned mean network.  The
+presets therefore set ``prior_weight_log_sigma = init_weight_log_sigma`` so the
+prior is exactly the initialization distribution and that gradient is zero at
+initialization.  Note the trade-off this implies: a tight prior is strong L2
+shrinkage on ``mu_W`` (its ``grad_mu`` ratio is ~45x larger than the unit
+prior's per unit ``beta``), so with a matched prior ``beta`` above ~0.1
+legitimately collapses the weights.  The sweep is expected to show that.
 """
 
 from __future__ import annotations
@@ -35,7 +85,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Dict, Optional
 
-from bpc.config import BATCH_SIZE, HIDDEN, LATENT_LR, LATENT_STEPS, MNIST_SOURCE, SEED
+import jax.numpy as jnp
+
+from bpc.config import BATCH_SIZE, DTYPE, HIDDEN, LATENT_LR, LATENT_STEPS, MNIST_SOURCE, SEED
 
 
 #: ``beta`` values required by the VBPC proposal.
@@ -44,6 +96,21 @@ VBPC_BETA_SWEEP = (0.0, 0.001, 0.01, 0.1, 1.0)
 VBPC_MNIST_EPOCHS = 100
 VBPC_TWO_MOONS_EPOCHS = 100
 VBPC_TWO_MOONS_HIDDEN = 100
+
+#: Two moons trains on ``n_train=1000`` points (see ``configs/vbpc_two_moons.yaml``).
+#: ``batch_size`` must be *strictly smaller* than ``n_train``: with a single batch
+#: per epoch ``batch_iterator`` yields exactly one optimizer step per epoch, so a
+#: 100-epoch run performs only 100 Adam steps.  At ``weight_lr=1e-3`` that caps
+#: the total movement of any weight at ~0.1, which is the same order as the
+#: ``U(-1/sqrt(d_in), 1/sqrt(d_in))`` initialization, so the mean network never
+#: leaves its initialization.  100 gives 10 steps/epoch and 1000 steps/run.
+VBPC_TWO_MOONS_BATCH_SIZE = 100
+
+#: ``tau = exp(VBPC_INIT_WEIGHT_LOG_SIGMA)`` is the standard deviation of the
+#: weight prior.  Matching the prior to the initialization is what keeps
+#: ``dKL/dlog_sigma = sigma^2 - tau^2`` at zero instead of ~-1 (see the module
+#: docstring); it is applied to every preset below.
+VBPC_INIT_WEIGHT_LOG_SIGMA = -3.0
 
 _PC_REDUCTIONS = ("mean", "sum")
 _KL_REDUCTIONS = ("mean", "sum")
@@ -80,7 +147,13 @@ class VBPCConfig:
     # Weight variational parameter learning (q(W) = N(mu_W, diag(sigma_W^2))).
     weight_lr: float = 1e-3
     weight_grad_clip: Optional[float] = None
-    init_weight_log_sigma: float = -3.0
+    init_weight_log_sigma: float = VBPC_INIT_WEIGHT_LOG_SIGMA
+    #: log standard deviation of the Gaussian weight prior, p(W) = N(0, tau^2 I).
+    #: ``0.0`` is the proposal's standard normal ``N(0, I)``.  Set it equal to
+    #: ``init_weight_log_sigma`` so the prior matches the initialization and
+    #: ``dKL/dlog_sigma = sigma_W^2 - tau^2`` starts at zero instead of ~-1
+    #: (a -1 there inflates the sampled weight noise ~20x over a full run).
+    prior_weight_log_sigma: float = VBPC_INIT_WEIGHT_LOG_SIGMA
 
     # Latent variational parameter inference (q(z_l) = N(mu_l, diag(sigma_l^2))).
     latent_steps: int = LATENT_STEPS
@@ -117,6 +190,10 @@ def validate_vbpc_config(cfg: VBPCConfig) -> None:
         raise ValueError(f"Unknown normalize={cfg.normalize}")
     if cfg.beta < 0.0:
         raise ValueError(f"beta must be non-negative, got {cfg.beta}")
+    if not jnp.isfinite(jnp.asarray(cfg.prior_weight_log_sigma, dtype=DTYPE)):
+        raise ValueError(f"prior_weight_log_sigma must be finite, got {cfg.prior_weight_log_sigma}")
+    if cfg.batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {cfg.batch_size}")
     if cfg.error_variance <= 0.0:
         raise ValueError(f"error_variance must be positive, got {cfg.error_variance}")
     if cfg.weight_sigma_min <= 0.0 or cfg.weight_sigma_max <= cfg.weight_sigma_min:
@@ -168,7 +245,8 @@ def make_vbpc_presets() -> Dict[str, VBPCConfig]:
             epochs=VBPC_TWO_MOONS_EPOCHS,
             hidden=VBPC_TWO_MOONS_HIDDEN,
             hidden_layers=1,
-            batch_size=1000,
+            batch_size=VBPC_TWO_MOONS_BATCH_SIZE,
             beta=0.01,
+            prior_weight_log_sigma=VBPC_INIT_WEIGHT_LOG_SIGMA,
         ),
     }

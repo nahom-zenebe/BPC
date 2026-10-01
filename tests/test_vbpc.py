@@ -43,6 +43,7 @@ from vbpc.posterior.weight_posterior import (
     sample_weight_matrices,
     weight_diagnostics,
     weight_kl,
+    weight_kl_grads,
     weight_shapes,
     weight_sigma,
 )
@@ -84,8 +85,8 @@ def test_gaussian_reparameterization_is_exact_deterministic_and_unbiased():
     for p in params:
         assert p.mu.dtype == DTYPE
         assert p.log_sigma.dtype == DTYPE
-        np.testing.assert_allclose(np.asarray(p.log_sigma), -3.0)
-        np.testing.assert_allclose(np.asarray(weight_sigma(p.log_sigma)), np.exp(-3.0))
+        np.testing.assert_allclose(np.asarray(p.log_sigma), -6.0)
+        np.testing.assert_allclose(np.asarray(weight_sigma(p.log_sigma)), np.exp(-6.0))
 
     mu = jnp.asarray([[1.0, -2.0], [0.5, 0.0]], dtype=DTYPE)
     sigma = jnp.asarray([[0.5, 2.0], [0.25, 1.0]], dtype=DTYPE)
@@ -315,13 +316,16 @@ def test_vbpc_training_step_uses_pc_for_latents_and_total_for_weights():
     x, y = tiny_batch()
     beta = jnp.asarray(cfg.beta, dtype=DTYPE)
 
-    total, terms, grads, latents, latent_diag, epsilons = vbpc_loss_and_grads(
+    total, terms, grads, latents, latent_diag, epsilons, kl_grads = vbpc_loss_and_grads(
         cfg, layer_dims, params, x, y, key, beta
     )
     assert float(total) == pytest.approx(float(terms[0]) + cfg.beta * float(terms[1]), rel=1e-12)
     assert float(terms[0]) > 0.0
-    assert float(terms[1]) == pytest.approx(float(weight_kl(params, cfg.kl_reduction)), rel=1e-12)
-    assert_tree_finite((grads, latents, epsilons))
+    assert float(terms[1]) == pytest.approx(
+        float(weight_kl(params, cfg.kl_reduction, prior_log_sigma=cfg.prior_weight_log_sigma)),
+        rel=1e-12,
+    )
+    assert_tree_finite((grads, latents, epsilons, kl_grads))
     assert len(grads) == len(params)
     assert float(latent_diag.final_energy) < float(latent_diag.init_energy)
 
@@ -365,16 +369,154 @@ def test_vbpc_training_step_uses_pc_for_latents_and_total_for_weights():
     assert float(diag_big.total_loss) > float(diag_zero.total_loss)
     assert float(diag_big.pc_energy) == pytest.approx(float(diag_zero.pc_energy), rel=1e-9)
 
-    _, terms_zero, grads_zero, latents_zero, _, _ = vbpc_loss_and_grads(
+    _, terms_zero, grads_zero, latents_zero, _, _, _ = vbpc_loss_and_grads(
         replace(cfg, beta=0.0), layer_dims, params, x, y, key, jnp.asarray(0.0)
     )
-    _, terms_big, grads_big, latents_big, _, _ = vbpc_loss_and_grads(
+    _, terms_big, grads_big, latents_big, _, _, _ = vbpc_loss_and_grads(
         cfg, layer_dims, params, x, y, key, jnp.asarray(1.0)
     )
     for a, b in zip(latents_zero.mu, latents_big.mu):
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=0, atol=0)
     assert float(terms_zero[0]) == pytest.approx(float(terms_big[0]), rel=1e-12)
     assert any(not np.allclose(np.asarray(a.mu), np.asarray(b.mu)) for a, b in zip(grads_zero, grads_big))
+
+
+def test_prior_matches_initialization_so_the_kl_does_not_inflate_weight_noise():
+    """Root cause 3: a prior that matches the init leaves dKL/dlog_sigma at 0.
+
+    With the proposal's ``N(0, I)`` prior and ``sigma_W = exp(-3)``,
+    ``dKL/dlog_sigma = sigma^2 - 1 ~ -0.997``, so gradient descent inflates the
+    sampled weight noise ~20x towards variance 1 and destroys the mean network.
+    """
+
+    layer_dims = (2, 3, 2)
+    params = init_vbpc_weight_params(layer_dims, jax.random.PRNGKey(11), -3.0)
+
+    def log_sigma_grad(prior_log_sigma, reduction="sum"):
+        grads = weight_kl_grads(params, reduction, prior_log_sigma=prior_log_sigma)
+        return float(jnp.mean(grads[0].log_sigma))
+
+    # Per entry, a unit prior gives dKL/dlog_sigma = sigma^2 - 1 = -0.99752, i.e.
+    # it actively pushes sigma up towards 1 (~20x the init variance).
+    assert log_sigma_grad(0.0) == pytest.approx(-1.0 + np.exp(-6.0), rel=1e-9)
+    assert log_sigma_grad(0.0) < -0.9
+
+    # Prior matched to the init: the push is exactly zero, so sigma_W does not
+    # drift away from its initialization.
+    assert log_sigma_grad(-3.0) == pytest.approx(0.0, abs=1e-12)
+    # "mean" only rescales by the entry count, so the sign and zero are unchanged.
+    assert log_sigma_grad(-3.0, "mean") == pytest.approx(0.0, abs=1e-12)
+
+    # The closed form must agree with autodiff for both priors.
+    for prior in (0.0, -3.0):
+        autodiff = jax.grad(lambda pp: weight_kl(pp, "mean", prior_log_sigma=prior))(params)
+        closed = weight_kl_grads(params, "mean", prior_log_sigma=prior)
+        for a, b in zip(autodiff, closed):
+            np.testing.assert_allclose(np.asarray(a.mu), np.asarray(b.mu), rtol=1e-12, atol=1e-18)
+            np.testing.assert_allclose(
+                np.asarray(a.log_sigma), np.asarray(b.log_sigma), rtol=1e-12, atol=1e-18
+            )
+
+    # A matched prior gives exactly zero KL when q == p.
+    matched = (
+        VBPCWeightParams(mu=jnp.zeros((2, 3), dtype=DTYPE), log_sigma=jnp.full((2, 3), -3.0, dtype=DTYPE)),
+    )
+    assert float(weight_kl(matched, "sum", prior_log_sigma=-3.0)) == pytest.approx(0.0, abs=1e-18)
+
+
+def test_prior_at_zero_reduces_to_the_proposal_standard_normal_kl():
+    """``prior_log_sigma=0`` must stay bit-compatible with the proposal's N(0, I)."""
+
+    params = init_vbpc_weight_params((2, 3, 2), jax.random.PRNGKey(12), -3.0)
+    expected = sum(
+        0.5 * jnp.sum(p.mu ** 2 + jnp.exp(2 * p.log_sigma) - 1.0 - 2.0 * p.log_sigma) for p in params
+    )
+    np.testing.assert_allclose(
+        np.asarray(weight_kl(params, "sum", prior_log_sigma=0.0)),
+        np.asarray(expected),
+        rtol=1e-12,
+    )
+    # The default argument is the standard normal, so old call sites are unchanged.
+    np.testing.assert_allclose(
+        np.asarray(weight_kl(params, "sum")), np.asarray(expected), rtol=1e-12
+    )
+
+
+def test_two_moons_preset_runs_many_optimizer_steps_per_epoch():
+    """Root cause 1: batch_size must be < n_train or the run cannot train.
+
+    ``batch_size == n_train`` yields one batch per epoch, so a 100-epoch run
+    performs 100 Adam steps, which at weight_lr=1e-3 cannot move the weights out
+    of their ``U(-1/sqrt(d_in), 1/sqrt(d_in))`` initialization.
+    """
+
+    from vbpc.config import VBPC_TWO_MOONS_BATCH_SIZE, make_vbpc_presets
+
+    presets = make_vbpc_presets()
+    cfg = presets["vbpc_two_moons"]
+    n_train = 1000  # configs/vbpc_two_moons.yaml
+
+    assert cfg.batch_size == VBPC_TWO_MOONS_BATCH_SIZE
+    assert cfg.batch_size < n_train, "batch_size must be smaller than n_train"
+
+    steps_per_epoch = -(-n_train // cfg.batch_size)
+    assert steps_per_epoch >= 2
+    assert steps_per_epoch * cfg.epochs >= 500
+
+    # The prior is matched to the initialization in every preset.
+    for preset in presets.values():
+        assert preset.prior_weight_log_sigma == preset.init_weight_log_sigma
+
+
+def test_step_diagnostics_report_the_pc_kl_gradient_balance():
+    """The beta sweep is only interpretable with gradient norms, not loss ratios.
+
+    ``L_KL`` is ~110x larger than ``L_PC`` at initialization under the ``"mean"``
+    reductions, but ~96% of it is the additive ``-log sigma^2`` constant, which
+    carries almost no gradient.  These diagnostics report the gradient split
+    directly, which is what decides how much ``beta`` matters.
+    """
+
+    from vbpc.training.train_step import make_vbpc_train_step
+
+    cfg = tiny_cfg()
+    layer_dims = (2, 3, 2)
+    params = init_vbpc_weight_params(layer_dims, jax.random.PRNGKey(3), cfg.init_weight_log_sigma)
+    x, y = tiny_batch()
+    step, optimizer = make_vbpc_train_step(cfg, layer_dims)
+    opt_state = optimizer.init(params)
+    key = jax.random.PRNGKey(4)
+
+    _, _, diag_zero = step(params, opt_state, x, y, key, jnp.asarray(0.0, dtype=DTYPE))
+    assert float(diag_zero.kl_grad_norm) == pytest.approx(0.0, abs=1e-30)
+    assert float(diag_zero.kl_grad_share) == pytest.approx(0.0, abs=1e-12)
+    assert float(diag_zero.pc_grad_norm) > 0.0
+
+    _, _, diag_big = step(params, opt_state, x, y, key, jnp.asarray(1.0, dtype=DTYPE))
+    assert float(diag_big.kl_grad_norm) > 0.0
+    # beta must actually change how much of the update the prior explains.
+    assert float(diag_big.kl_grad_share) > float(diag_zero.kl_grad_share)
+    # A matched prior is a tight one (tau^2 = 0.0025, so dKL/dmu = mu/tau^2 is
+    # ~400x stronger than under N(0, I)), so at beta=1 the prior dominates and
+    # the weight means are expected to collapse -- that is the sweep working.
+    assert float(diag_big.kl_grad_share) > 0.5
+
+    # The share is a bounded, exact ratio of the two reported norms.
+    total_norm = float(diag_big.pc_grad_norm) + float(diag_big.kl_grad_norm)
+    assert 0.0 < float(diag_big.kl_grad_share) <= 1.0
+    assert float(diag_big.kl_grad_share) == pytest.approx(
+        float(diag_big.kl_grad_norm) / total_norm, rel=1e-12
+    )
+    # A matched prior contributes no log_sigma gradient at initialization ...
+    assert float(diag_big.kl_log_sigma_grad) == pytest.approx(0.0, abs=1e-12)
+
+    # ... whereas a unit prior does, and it is negative (it inflates the noise).
+    unit_cfg = replace(cfg, prior_weight_log_sigma=0.0)
+    unit_step, _ = make_vbpc_train_step(unit_cfg, layer_dims)
+    _, _, unit_diag = unit_step(params, opt_state, x, y, key, jnp.asarray(1.0, dtype=DTYPE))
+    # The sign is the diagnostic: negative => the prior pushes sigma_W up.
+    assert float(unit_diag.kl_log_sigma_grad) < 0.0
+    assert float(unit_diag.kl_log_sigma_grad) == pytest.approx(-0.9975 / 9.0, rel=0.2)
 
 
 def test_shapes_gradients_jit_and_optimizer_backends():
@@ -436,7 +578,12 @@ def test_shapes_gradients_jit_and_optimizer_backends():
         np.testing.assert_allclose(np.asarray(a.mu), np.asarray(b.mu), rtol=1e-12)
         np.testing.assert_allclose(np.asarray(a.log_sigma), np.asarray(b.log_sigma), rtol=1e-12)
     for leaf_a, leaf_b in zip(jax.tree.leaves(jit_state), jax.tree.leaves(eager_state)):
-        np.testing.assert_allclose(np.asarray(leaf_a), np.asarray(leaf_b), rtol=1e-12)
+        # `atol` is required, not slack: Adam's second moment for log_sigma is a
+        # squared gradient that is ~1e-13 here (the prior is matched to the
+        # initialization, so it contributes no log_sigma gradient), and a pure
+        # relative comparison of a quantity that close to zero is decided by XLA
+        # op reordering rather than by any real disagreement.
+        np.testing.assert_allclose(np.asarray(leaf_a), np.asarray(leaf_b), rtol=1e-12, atol=1e-20)
     assert float(jit_diag.total_loss) == pytest.approx(float(eager_diag.total_loss), rel=1e-12)
     assert float(jit_diag.pc_energy) == pytest.approx(float(eager_diag.pc_energy), rel=1e-12)
 

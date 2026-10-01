@@ -163,7 +163,11 @@ def total_vbpc_objective(
 
     l_pc = pc_energy(z_states, weights, cfg)
     l_kl = weight_kl(
-        weight_params, cfg.kl_reduction, cfg.weight_sigma_min, cfg.weight_sigma_max
+        weight_params,
+        cfg.kl_reduction,
+        cfg.weight_sigma_min,
+        cfg.weight_sigma_max,
+        cfg.prior_weight_log_sigma,
     )
     beta = jnp.asarray(cfg.beta, dtype=DTYPE)
     return l_pc + beta * l_kl, (l_pc, l_kl)

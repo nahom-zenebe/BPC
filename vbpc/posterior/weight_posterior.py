@@ -116,10 +116,36 @@ def sample_weight_matrices(
     )
 
 
-def gaussian_kl_elementwise(mu: Array, sigma: Array, log_sigma: Array) -> Array:
-    """``0.5 * (mu^2 + sigma^2 - 1 - log(sigma^2))`` against a standard normal prior."""
+def prior_sigma(prior_log_sigma: Array = 0.0) -> Array:
+    """Standard deviation ``tau`` of the isotropic Gaussian weight prior.
 
-    return 0.5 * (mu ** 2 + sigma ** 2 - 1.0 - 2.0 * log_sigma)
+    ``prior_log_sigma = 0`` gives ``tau = 1``, i.e. the standard normal
+    ``p(W) = N(0, I)`` written in the proposal.
+    """
+
+    return jnp.exp(jnp.asarray(prior_log_sigma, dtype=DTYPE))
+
+
+def gaussian_kl_elementwise(
+    mu: Array,
+    sigma: Array,
+    log_sigma: Array,
+    prior_log_sigma: Array = 0.0,
+) -> Array:
+    """``0.5 * (mu^2 + sigma^2 - 1 - log(sigma^2))`` per entry against a prior
+    ``p(W) = N(0, tau^2 I)``.
+
+    With ``prior_log_sigma = 0`` (``tau = 1``) this is exactly the proposal's
+    ``KL(q(W) || N(0, I))`` element.  Passing ``prior_log_sigma ==
+    init_weight_log_sigma`` makes the prior match the initialization, so
+    ``dKL/dlog_sigma = sigma^2 - tau^2`` is zero at initialization instead of the
+    ``~ -1`` that a unit prior produces against a thin ``sigma = exp(-3)`` start.
+    """
+
+    tau_sq = prior_sigma(prior_log_sigma) ** 2
+    return 0.5 * (
+        (mu ** 2 + sigma ** 2) / tau_sq - 1.0 - 2.0 * (log_sigma - jnp.log(prior_sigma(prior_log_sigma)))
+    )
 
 
 def weight_kl(
@@ -127,8 +153,9 @@ def weight_kl(
     reduction: str = "mean",
     sigma_min: float = 1e-8,
     sigma_max: float = 1e3,
+    prior_log_sigma: Array = 0.0,
 ) -> Array:
-    """Analytic ``KL(q(W) || N(0, I))`` summed over layers.
+    """Analytic ``KL(q(W) || p(W))`` summed over layers, with ``p(W) = N(0, tau^2 I)``.
 
     ``reduction="sum"`` is the literal proposal formula (sum over every weight
     entry); ``reduction="mean"`` averages over the entries of each layer before
@@ -141,9 +168,51 @@ def weight_kl(
     total = jnp.asarray(0.0, dtype=DTYPE)
     for p in params:
         sigma = weight_sigma(p.log_sigma, sigma_min, sigma_max)
-        elementwise = gaussian_kl_elementwise(p.mu, sigma, jnp.log(sigma))
+        elementwise = gaussian_kl_elementwise(p.mu, sigma, jnp.log(sigma), prior_log_sigma)
         total = total + (jnp.mean(elementwise) if reduction == "mean" else jnp.sum(elementwise))
     return total
+
+
+def weight_kl_grads(
+    params: Tuple[VBPCWeightParams, ...],
+    reduction: str = "mean",
+    sigma_min: float = 1e-8,
+    sigma_max: float = 1e3,
+    prior_log_sigma: Array = 0.0,
+) -> Tuple[VBPCWeightParams, ...]:
+    """Closed-form ``dL_KL/d(mu_W, log_sigma_W)``, shaped like ``params``.
+
+    The KL is analytic and factorized, so its gradient is available in closed
+    form and does not need a backward pass:
+
+        d/d mu       = mu / tau^2
+        d/d log_sigma = sigma^2 - tau^2
+
+    each divided by the per-layer entry count for ``reduction="mean"``.  This is
+    used to report how much of the weight update the prior explains; computing
+    it analytically keeps the autodiff graph of the main objective untouched (an
+    extra ``jax.grad`` over the same jit'd function perturbs XLA fusion enough to
+    move otherwise-identical Adam moments past a 1e-12 relative tolerance).
+
+    The ``sigma`` clip is inactive for any ``log_sigma`` strictly inside
+    ``[log(sigma_min), log(sigma_max)]``; outside it the true gradient is zero
+    and this closed form does not model that.
+    """
+
+    if reduction not in ("mean", "sum"):
+        raise ValueError(f"Unknown reduction={reduction}")
+    tau_sq = prior_sigma(prior_log_sigma) ** 2
+    out = []
+    for p in params:
+        sigma = weight_sigma(p.log_sigma, sigma_min, sigma_max)
+        scale = 1.0 if reduction == "sum" else 1.0 / jnp.asarray(p.mu.size, dtype=DTYPE)
+        out.append(
+            VBPCWeightParams(
+                mu=p.mu * (scale / tau_sq),
+                log_sigma=(sigma ** 2 - tau_sq) * jnp.asarray(scale, dtype=DTYPE),
+            )
+        )
+    return tuple(out)
 
 
 def mean_weight_variance(

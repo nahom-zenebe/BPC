@@ -1,6 +1,7 @@
 preset: vbpc_two_moons
 config:
   name: vbpc_two_moons
+  batch_size: 100
 logging:
   save_dir: runs
 mode: sweep

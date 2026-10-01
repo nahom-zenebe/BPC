@@ -130,6 +130,24 @@ def train_vbpc_mnist_dataset(
     x_train_eval = jnp.asarray(x_train_np[:TRAIN_SUBSET_SIZE], dtype=DTYPE) if REPORT_TRAIN_SUBSET_ACC else None
     y_train_eval = jnp.asarray(y_train_np[:TRAIN_SUBSET_SIZE], dtype=DTYPE) if REPORT_TRAIN_SUBSET_ACC else None
 
+    n_train = int(x_train_np.shape[0])
+    steps_per_epoch = max((n_train + cfg.batch_size - 1) // cfg.batch_size, 1)
+    total_steps = steps_per_epoch * cfg.epochs
+    # A single batch per epoch (batch_size >= n_train) silently turns the whole
+    # run into `epochs` optimizer steps, which at weight_lr=1e-3 cannot move the
+    # weights out of their initialization.  Fail loudly instead of logging a
+    # flat, unconverged sweep.
+    if steps_per_epoch < 2:
+        print(
+            f"WARNING: batch_size={cfg.batch_size} >= n_train={n_train} yields "
+            f"{steps_per_epoch} optimizer step(s) per epoch -> only {total_steps} steps "
+            f"for the whole run. Lower batch_size to get more than one step per epoch."
+        )
+    print(
+        f"optimizer steps: {steps_per_epoch}/epoch x {cfg.epochs} epochs = {total_steps} total "
+        f"(n_train={n_train}, batch_size={cfg.batch_size}, weight_lr={cfg.weight_lr:g})"
+    )
+
     best_params = weight_params
     best_acc = -1.0
     best_epoch = 0
@@ -179,6 +197,7 @@ def train_vbpc_mnist_dataset(
             "beta": float(cfg.beta),
             "epoch": epoch,
             "global_step": global_step,
+            "steps_per_epoch": steps_per_epoch,
             "train10k_acc": train_acc,
             "test_acc": test_metrics["acc"],
             "test_nll": test_metrics["nll"],
@@ -241,6 +260,7 @@ def train_vbpc_mnist_dataset(
         "final_nll": float(final_row.get("test_nll", float("nan"))),
         "final_ece": float(final_row.get("test_ece", float("nan"))),
         "mean_weight_variance": float(diag["mean_weight_variance"]),
+        "total_steps": float(total_steps),
         "runtime_sec": time.time() - t0,
     }
     metrics.update({k: float(v) for k, v in final_row.items() if k.startswith("mem_")})
@@ -300,12 +320,14 @@ def run_vbpc_beta_sweep(
             "final_nll": metrics["final_nll"],
             "final_ece": metrics["final_ece"],
             "mean_weight_variance": metrics["mean_weight_variance"],
+            "total_steps": metrics["total_steps"],
             "runtime_sec": metrics["runtime_sec"],
         })
         print(
             f"[beta sweep] beta={beta:g}: best_acc={metrics['best_acc'] * 100:.2f}% "
             f"nll={metrics['final_nll']:.4f} ece={metrics['final_ece']:.4f} "
-            f"var_W={metrics['mean_weight_variance']:.3e}"
+            f"var_W={metrics['mean_weight_variance']:.3e} "
+            f"steps={metrics['total_steps']:.0f}"
         )
 
     json_path = os.path.join(save_dir, f"{summary_name}.json")
