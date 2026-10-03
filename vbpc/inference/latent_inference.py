@@ -13,11 +13,20 @@ weight/variational-parameter objective ``L_total = L_PC + beta * L_KL``.
 Because no KL regularizes the latent scale, ``L_PC`` alone pushes the variational
 latent scales ``sigma_l`` downwards; the diagnostics expose
 ``sigma_mean_per_step`` so the effect is observable in the logs.
+
+Persistent latent optimizer state
+----------------------------------
+``vbpc_latent_inference`` now accepts an optional ``latent_opt_state`` and returns
+the updated state alongside the inferred latents.  When the caller passes the
+returned state back on the next call (i.e. across batches within the same epoch)
+the Adam moments accumulate across the whole epoch instead of being reset to zero
+on every batch.  Pass ``None`` to get the original per-batch-reset behaviour
+(used at the start of each epoch to reset momentum).
 """
 
 from __future__ import annotations
 
-from typing import NamedTuple, Tuple
+from typing import Any, NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -101,6 +110,55 @@ def deterministic_pc_energy(
     return pc_energy(clamped_states(mean_states(states), x, y), weights, cfg)
 
 
+def latent_kl(
+    states: VBPCStates,
+    cfg: VBPCConfig,
+) -> Array:
+    """Analytic ``KL(q(z_l) || N(0, I))`` summed over hidden layers.
+
+    Used as a light regularizer on the latent scale when ``cfg.latent_kl_weight > 0``
+    to prevent ``sigma_l`` from collapsing to zero under ``L_PC`` alone.
+    """
+
+    total = jnp.asarray(0.0, dtype=DTYPE)
+    for ls in states.log_sigma:
+        sigma = state_sigma(ls, cfg.state_sigma_min, cfg.state_sigma_max)
+        # KL(N(mu, sigma^2) || N(0, 1)) = 0.5*(mu^2 + sigma^2 - 1 - log(sigma^2))
+        mu = states.mu[states.log_sigma.index(ls)] if hasattr(states.log_sigma, "index") else jnp.zeros_like(ls)
+        total = total + jnp.mean(0.5 * (sigma ** 2 - 1.0 - 2.0 * jnp.log(sigma)))
+    return total
+
+
+def latent_objective(
+    states: VBPCStates,
+    weights: Tuple[Array, ...],
+    x: Array,
+    y: Array,
+    cfg: VBPCConfig,
+    key: Array,
+) -> Array:
+    """``L_PC + latent_kl_weight * KL(q(z) || N(0,I))`` used for latent gradients."""
+
+    hidden = sample_states(states, key, cfg.state_sigma_min, cfg.state_sigma_max)
+    l_pc = pc_energy(clamped_states(hidden, x, y), weights, cfg)
+    if cfg.latent_kl_weight > 0.0:
+        kl = sum(
+            jnp.mean(
+                0.5 * (state_sigma(ls, cfg.state_sigma_min, cfg.state_sigma_max) ** 2
+                       - 1.0
+                       - 2.0 * jnp.log(state_sigma(ls, cfg.state_sigma_min, cfg.state_sigma_max)))
+            )
+            for ls in states.log_sigma
+        )
+        return l_pc + jnp.asarray(cfg.latent_kl_weight, dtype=DTYPE) * kl
+    return l_pc
+
+
+def make_latent_optimizer(cfg: VBPCConfig):
+    """Create the latent Adam optimizer (shared across calls for state persistence)."""
+    return make_optimizer(cfg.latent_lr)
+
+
 def vbpc_latent_inference(
     weight_params: Tuple[VBPCWeightParams, ...],
     layer_dims: Tuple[int, ...],
@@ -109,8 +167,16 @@ def vbpc_latent_inference(
     y: Array,
     cfg: VBPCConfig,
     key: Array,
-) -> Tuple[VBPCStates, VBPCLatentDiagnostics]:
-    """Adam inference of ``(mu_l, log_sigma_l)`` minimizing ``L_PC`` only."""
+    latent_opt_state=None,
+) -> Tuple[VBPCStates, VBPCLatentDiagnostics, Any]:
+    """Adam inference of ``(mu_l, log_sigma_l)`` minimizing ``L_PC + latent_kl_weight * KL``.
+
+    When ``latent_opt_state`` is not ``None`` the provided Adam moments are used
+    as the starting state, allowing the caller to persist momentum across batches
+    within an epoch.  The updated optimizer state is returned as the third element
+    so the caller can thread it forward.  Pass ``None`` to reset (e.g. at the
+    start of each epoch).
+    """
 
     steps = int(cfg.latent_steps)
     if steps < 1:
@@ -118,8 +184,8 @@ def vbpc_latent_inference(
     n_states = max(len(weights) - 1, 0)
 
     states = init_vbpc_latents(weight_params, layer_dims, x, cfg)
-    optimizer = make_optimizer(cfg.latent_lr)
-    opt_state = optimizer.init(states)
+    optimizer = make_latent_optimizer(cfg)
+    opt_state = optimizer.init(states) if latent_opt_state is None else latent_opt_state
 
     e_log = jnp.zeros((steps,), dtype=DTYPE)
     em_log = jnp.zeros((steps,), dtype=DTYPE)
@@ -131,7 +197,7 @@ def vbpc_latent_inference(
     def body(carry, i):
         states, opt_state, key, e_log, em_log, g_log, gl_log, z_log, s_log = carry
         key, sub = jax.random.split(key)
-        energy, grads = jax.value_and_grad(latent_pc_energy)(states, weights, x, y, cfg, sub)
+        energy, grads = jax.value_and_grad(latent_objective)(states, weights, x, y, cfg, sub)
         e_log = e_log.at[i].set(energy)
         em_log = em_log.at[i].set(deterministic_pc_energy(states, weights, x, y, cfg))
         g_log = g_log.at[i].set(jnp.stack([jnp.linalg.norm(g) for g in grads.mu]))
@@ -144,7 +210,7 @@ def vbpc_latent_inference(
         return (states, opt_state, key, e_log, em_log, g_log, gl_log, z_log, s_log), None
 
     carry = (states, opt_state, key, e_log, em_log, g_log, gl_log, z_log, s_log)
-    (states, _, _, e_log, em_log, g_log, gl_log, z_log, s_log), _ = jax.lax.scan(
+    (states, opt_state, _, e_log, em_log, g_log, gl_log, z_log, s_log), _ = jax.lax.scan(
         body, carry, jnp.arange(steps)
     )
 
@@ -160,4 +226,4 @@ def vbpc_latent_inference(
         init_energy=em_log[0],
         final_energy=em_log[-1],
     )
-    return states, diag
+    return states, diag, opt_state

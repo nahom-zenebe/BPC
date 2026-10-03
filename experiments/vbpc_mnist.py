@@ -1,14 +1,4 @@
-"""Thin MNIST VBPC experiment entry point.
-
-Example commands::
-
-    python -m experiments.vbpc_mnist --config configs/vbpc_mnist.yaml
-    python -m experiments.vbpc_mnist --config configs/vbpc_mnist.yaml --mode single --beta 0.01
-    python -m experiments.vbpc_mnist --betas 0,0.01,0.1
-
-The YAML file selects a VBPC preset, optional config overrides, the run mode
-(``single`` or ``sweep``) and the ``beta`` list of the sweep.
-"""
+"""Thin MNIST VBPC experiment entry point """
 
 from __future__ import annotations
 

@@ -23,6 +23,7 @@ from bpc.config import DTYPE, Array
 from vbpc.config import VBPCConfig
 from vbpc.inference.latent_inference import (
     VBPCLatentDiagnostics,
+    make_latent_optimizer,
     vbpc_latent_inference,
 )
 from vbpc.inference.objectives import (
@@ -87,18 +88,23 @@ def sample_weights_and_latents(
     yb: Array,
     cfg: VBPCConfig,
     key: Array,
-) -> Tuple[Tuple[Array, ...], Tuple[Array, ...], VBPCStates, VBPCLatentDiagnostics]:
-    """One weight sample plus latent inference on ``L_PC`` for a batch."""
+    latent_opt_state=None,
+) -> Tuple[Tuple[Array, ...], Tuple[Array, ...], VBPCStates, VBPCLatentDiagnostics, Any]:
+    """One weight sample plus latent inference on ``L_PC`` for a batch.
+
+    Returns the updated ``latent_opt_state`` so the caller can persist Adam
+    moments across batches within an epoch.
+    """
 
     key_w, key_latent = jax.random.split(key)
     epsilons = sample_weight_epsilons(weight_params, key_w)
     weights = reparameterize_weight_matrices(
         weight_params, epsilons, cfg.weight_sigma_min, cfg.weight_sigma_max
     )
-    latents, latent_diag = vbpc_latent_inference(
-        weight_params, layer_dims, weights, xb, yb, cfg, key_latent
+    latents, latent_diag, new_latent_opt_state = vbpc_latent_inference(
+        weight_params, layer_dims, weights, xb, yb, cfg, key_latent, latent_opt_state
     )
-    return weights, epsilons, latents, latent_diag
+    return weights, epsilons, latents, latent_diag, new_latent_opt_state
 
 
 def vbpc_loss_and_grads(
@@ -109,14 +115,19 @@ def vbpc_loss_and_grads(
     yb: Array,
     key: Array,
     beta: Optional[Array] = None,
-) -> Tuple[Array, Tuple[Array, Array], Any, VBPCStates, VBPCLatentDiagnostics, Tuple[Array, ...], Any]:
-    """``L_total``, its two terms, gradients and the inferred latents for one batch."""
+    latent_opt_state=None,
+) -> Tuple[Array, Tuple[Array, Array], Any, VBPCStates, VBPCLatentDiagnostics, Tuple[Array, ...], Any, Any]:
+    """``L_total``, its two terms, gradients and the inferred latents for one batch.
 
-    weights, epsilons, latents, latent_diag = sample_weights_and_latents(
-        weight_params, layer_dims, xb, yb, cfg, key
+    Gradients are averaged over ``cfg.n_weight_samples`` independent weight
+    epsilon draws to reduce single-sample variance.  Returns the updated
+    ``latent_opt_state`` as the last element.
+    """
+
+    weights, epsilons, latents, latent_diag, new_latent_opt_state = sample_weights_and_latents(
+        weight_params, layer_dims, xb, yb, cfg, key, latent_opt_state
     )
     frozen = jax.lax.stop_gradient(latents)
-    eps_states = sample_state_epsilons(frozen, jax.random.fold_in(key, 1))
     beta_value = resolve_beta(cfg, beta)
 
     def kl_only(params):
@@ -125,25 +136,39 @@ def vbpc_loss_and_grads(
             cfg.prior_weight_log_sigma,
         )
 
-    def loss_fn(params):
+    def loss_fn_for_eps(params, eps, eps_state_key):
+        """L_PC for one weight epsilon sample with a fresh state epsilon."""
         sampled_weights = reparameterize_weight_matrices(
-            params, epsilons, cfg.weight_sigma_min, cfg.weight_sigma_max
+            params, eps, cfg.weight_sigma_min, cfg.weight_sigma_max
         )
+        eps_states = sample_state_epsilons(frozen, eps_state_key)
         hidden = reparameterize_states(
             frozen, eps_states, cfg.state_sigma_min, cfg.state_sigma_max
         )
-        l_pc = pc_energy(clamped_states(hidden, xb, yb), sampled_weights, cfg)
+        return pc_energy(clamped_states(hidden, xb, yb), sampled_weights, cfg)
+
+    def loss_fn(params):
+        # Average L_PC gradient over n_weight_samples independent weight epsilons.
+        n = int(cfg.n_weight_samples)
+        keys = jax.random.split(jax.random.fold_in(key, 2), n)
+        eps_keys = jax.random.split(jax.random.fold_in(key, 3), n)
+        if n == 1:
+            l_pc = loss_fn_for_eps(params, epsilons, eps_keys[0])
+        else:
+            extra_eps = [
+                sample_weight_epsilons(params, keys[i]) for i in range(1, n)
+            ]
+            all_eps = [epsilons] + extra_eps
+            l_pc = sum(loss_fn_for_eps(params, e, eps_keys[i]) for i, e in enumerate(all_eps)) / n
         l_kl = kl_only(params)
         return l_pc + beta_value * l_kl, (l_pc, l_kl)
 
     (total, (l_pc, l_kl)), grads = jax.value_and_grad(loss_fn, has_aux=True)(weight_params)
-    # Closed form (no extra backward pass through the PC graph), used only to
-    # report how much of the weight update the prior explains.
     kl_grads = weight_kl_grads(
         weight_params, cfg.kl_reduction, cfg.weight_sigma_min, cfg.weight_sigma_max,
         cfg.prior_weight_log_sigma,
     )
-    return total, (l_pc, l_kl), grads, latents, latent_diag, epsilons, kl_grads
+    return total, (l_pc, l_kl), grads, latents, latent_diag, epsilons, kl_grads, new_latent_opt_state
 
 
 def _grad_norm(grads: Any, field: str) -> Array:
@@ -227,18 +252,24 @@ def vbpc_train_step(
     key: Array,
     optimizer: VBPCOptimizer,
     beta: Optional[Array] = None,
-) -> Tuple[Tuple[VBPCWeightParams, ...], Any, VBPCDiagnostics]:
-    """One VBPC step: latent inference on ``L_PC`` then an Adam step on ``L_total``."""
+    latent_opt_state=None,
+) -> Tuple[Tuple[VBPCWeightParams, ...], Any, VBPCDiagnostics, Any]:
+    """One VBPC step: latent inference on ``L_PC`` then an Adam step on ``L_total``.
+
+    Returns ``(new_weight_params, new_opt_state, diag, new_latent_opt_state)``.
+    The caller should pass ``new_latent_opt_state`` back on the next call within
+    the same epoch and reset it to ``None`` at the start of each new epoch.
+    """
 
     beta_value = resolve_beta(cfg, beta)
-    total, terms, grads, _, latent_diag, epsilons, kl_grads = vbpc_loss_and_grads(
-        cfg, layer_dims, weight_params, xb, yb, key, beta_value
+    total, terms, grads, _, latent_diag, epsilons, kl_grads, new_latent_opt_state = vbpc_loss_and_grads(
+        cfg, layer_dims, weight_params, xb, yb, key, beta_value, latent_opt_state
     )
     new_params, new_opt_state = optimizer.update(weight_params, grads, opt_state)
     diag = build_step_diagnostics(
         cfg, new_params, terms, total, latent_diag, epsilons, beta_value, grads, kl_grads
     )
-    return new_params, new_opt_state, diag
+    return new_params, new_opt_state, diag, new_latent_opt_state
 
 
 def make_vbpc_train_step(
@@ -248,17 +279,20 @@ def make_vbpc_train_step(
 ):
     """Build the JIT-compiled VBPC step used by the trainer.
 
-    Returns ``(train_step, optimizer)``; the optimizer keeps its Adam moments in
-    ``opt_state`` across steps, so the returned instance must be reused for the
-    whole run.
+    Returns ``(train_step, optimizer, latent_optimizer)``.
+    - ``optimizer`` keeps weight Adam moments in ``opt_state`` across steps.
+    - ``latent_optimizer`` is used by the trainer to initialize a fresh
+      ``latent_opt_state`` at the start of each epoch; the state is then
+      threaded through batches so latent Adam moments persist within an epoch.
     """
 
     optimizer = optimizer if optimizer is not None else make_optimizer(cfg.weight_lr, cfg.weight_grad_clip)
+    latent_optimizer = make_latent_optimizer(cfg)
 
     @jax.jit
-    def train_step(weight_params, opt_state, xb, yb, key, beta):
+    def train_step(weight_params, opt_state, xb, yb, key, beta, latent_opt_state):
         return vbpc_train_step(
-            cfg, layer_dims, weight_params, opt_state, xb, yb, key, optimizer, beta
+            cfg, layer_dims, weight_params, opt_state, xb, yb, key, optimizer, beta, latent_opt_state
         )
 
-    return train_step, optimizer
+    return train_step, optimizer, latent_optimizer

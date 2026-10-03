@@ -161,6 +161,17 @@ class VBPCConfig:
     init_latent_log_sigma: float = -3.0
     hidden_init: str = "feedforward"
     input_activation: str = "identity"
+    #: Weight on the latent KL ``KL(q(z_l) || N(0, I))`` added to ``L_PC`` during
+    #: latent inference.  ``0.0`` (default) reproduces the original behaviour where
+    #: ``L_PC`` alone drives the latent optimizer, which collapses ``sigma_l``
+    #: downward with no floor.  A small value (e.g. ``1e-3``) prevents collapse
+    #: without meaningfully changing the inferred means.
+    latent_kl_weight: float = 0.0
+    #: Number of independent weight epsilon samples whose ``L_PC`` gradients are
+    #: averaged before the Adam weight update.  ``1`` (default) is the original
+    #: single-sample estimator; ``2``–``4`` reduces gradient variance at the cost
+    #: of proportionally more forward/backward passes through the PC graph.
+    n_weight_samples: int = 1
 
     # Per-layer error covariance Sigma_l = error_variance * I used by L_PC.
     error_variance: float = 1.0
@@ -200,6 +211,10 @@ def validate_vbpc_config(cfg: VBPCConfig) -> None:
         raise ValueError("weight_sigma_min/max must be positive and increasing.")
     if cfg.state_sigma_min <= 0.0 or cfg.state_sigma_max <= cfg.state_sigma_min:
         raise ValueError("state_sigma_min/max must be positive and increasing.")
+    if cfg.latent_kl_weight < 0.0:
+        raise ValueError(f"latent_kl_weight must be non-negative, got {cfg.latent_kl_weight}")
+    if cfg.n_weight_samples < 1:
+        raise ValueError(f"n_weight_samples must be >= 1, got {cfg.n_weight_samples}")
 
 _HIDDEN_INITS = ("feedforward", "zeros")
 _INPUT_ACTIVATIONS = ("identity", "relu")
@@ -248,5 +263,8 @@ def make_vbpc_presets() -> Dict[str, VBPCConfig]:
             batch_size=VBPC_TWO_MOONS_BATCH_SIZE,
             beta=0.01,
             prior_weight_log_sigma=VBPC_INIT_WEIGHT_LOG_SIGMA,
+            latent_steps=20,
+            latent_kl_weight=1e-3,
+            n_weight_samples=2,
         ),
     }

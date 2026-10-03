@@ -58,6 +58,25 @@ from vbpc.training.train_step import make_vbpc_train_step
 MNDataset = Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 
 
+def _make_dummy_latent_states(
+    layer_dims: Tuple[int, ...],
+    cfg: "VBPCConfig",
+    x_train_np: np.ndarray,
+) -> "VBPCStates":
+    """Build a zero-filled ``VBPCStates`` shaped for one batch, used only to
+    initialize the latent Adam optimizer state at the start of each epoch.
+    """
+    from vbpc.inference.objectives import VBPCStates
+
+    batch = min(int(cfg.batch_size), int(x_train_np.shape[0]))
+    mu = tuple(
+        jnp.zeros((batch, int(layer_dims[l])), dtype=DTYPE)
+        for l in range(1, len(layer_dims) - 1)
+    )
+    log_sigma = tuple(jnp.zeros_like(m) for m in mu)
+    return VBPCStates(mu=mu, log_sigma=log_sigma)
+
+
 def default_vbpc_config(seed: int = SEED) -> VBPCConfig:
     """VBPC default configuration (MNIST, ``beta = 0.01``)."""
 
@@ -107,7 +126,7 @@ def train_vbpc_mnist_dataset(
     key, sub = jax.random.split(key)
     weight_params = init_vbpc_weight_params(layer_dims, sub, cfg.init_weight_log_sigma)
 
-    train_step, optimizer = make_vbpc_train_step(cfg, layer_dims)
+    train_step, optimizer, latent_optimizer = make_vbpc_train_step(cfg, layer_dims)
     opt_state = optimizer.init(weight_params)
     beta_value = jnp.asarray(cfg.beta, dtype=DTYPE)
 
@@ -160,11 +179,18 @@ def train_vbpc_mnist_dataset(
         epoch_pc = 0.0
         epoch_kl = 0.0
         epoch_total = 0.0
+        # Reset latent Adam moments at the start of each epoch so the optimizer
+        # starts fresh but accumulates momentum across all batches within the epoch.
+        latent_opt_state = latent_optimizer.init(
+            _make_dummy_latent_states(layer_dims, cfg, x_train_np)
+        )
         for xb_np, yb_np in batch_iterator(x_train_np, y_train_np, cfg.batch_size, rng, shuffle=True):
             xb = jnp.asarray(xb_np, dtype=DTYPE)
             yb = jnp.asarray(yb_np, dtype=DTYPE)
             key, sub = jax.random.split(key)
-            weight_params, opt_state, diag = train_step(weight_params, opt_state, xb, yb, sub, beta_value)
+            weight_params, opt_state, diag, latent_opt_state = train_step(
+                weight_params, opt_state, xb, yb, sub, beta_value, latent_opt_state
+            )
             logger.log_batch(global_step, epoch, batch_in_epoch, diag, cfg.beta)
             epoch_pc += float(diag.pc_energy)
             epoch_kl += float(diag.weight_kl)

@@ -1,13 +1,3 @@
-"""Optimizers for VBPC variational parameters.
-
-The primary backend is `Optax <https://github.com/google-deepmind/optax>`_
-(added to ``requirements.txt`` for VBPC) and is used for both latent-state
-inference and weight variational-parameter learning.  A small built-in Adam is
-provided as a fallback so that the module stays importable in environments where
-Optax is not installed; both backends expose the same
-:class:`VBPCOptimizer` interface and share the same update rule.
-"""
-
 from __future__ import annotations
 
 from typing import Any, Optional, Tuple
