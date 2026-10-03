@@ -20,7 +20,7 @@ SWEEP_PRESETS = [
     "relaxed_prior_svi_2hidden_std",
 ]
 
-ENABLE_X64 = True
+ENABLE_X64 = False
 SAVE_DIR = "/content/bpc_faithful_runs"
 PLOT_CURVES = True
 LOGGING_MODE = "verbose"

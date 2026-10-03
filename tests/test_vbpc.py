@@ -1,3 +1,18 @@
+"""Tests for the Variational Bayesian Predictive Coding (VBPC) implementation.
+
+Covered here, as required by the VBPC proposal:
+
+1. Gaussian reparameterization of the weight posterior,
+2. analytic KL calculation,
+3. local predictive-coding energy,
+4. latent-state inference,
+5. the VBPC training step (latent inference on ``L_PC``, weights on ``L_total``),
+6. shape/gradient/JIT correctness, plus the VBPC YAML configuration.
+
+The BPC tests in ``tests/test_bpc.py`` continue to cover the original
+Matrix-Normal Wishart implementation.
+"""
+
 from __future__ import annotations
 
 from dataclasses import replace

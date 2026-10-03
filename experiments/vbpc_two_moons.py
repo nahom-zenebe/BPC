@@ -1,4 +1,15 @@
-"""Thin two-moons VBPC experiment entry point """
+"""Thin two-moons VBPC experiment entry point.
+
+Example commands::
+
+    python -m experiments.vbpc_two_moons --config configs/vbpc_two_moons.yaml
+    python -m experiments.vbpc_two_moons --config configs/vbpc_two_moons.yaml --mode single --beta 0.01
+    python -m experiments.vbpc_two_moons --betas 0,0.01,0.1
+
+The YAML file selects a VBPC preset, optional config overrides, the run mode
+(``single`` or ``sweep``), the ``beta`` list of the sweep and the two-moons
+``data`` block (``n_train``/``n_test``/``noise``).
+"""
 
 from __future__ import annotations
 

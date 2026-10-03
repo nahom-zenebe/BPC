@@ -1,6 +1,7 @@
 preset: vbpc_mnist_default
 config:
   name: vbpc_mnist
+  epochs: 30
 logging:
   save_dir: runs
 mode: sweep
