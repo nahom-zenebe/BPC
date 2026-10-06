@@ -20,7 +20,11 @@ import numpy as np
 from bpc.config import DTYPE, Array
 from vbpc.config import VBPCConfig
 from vbpc.layers.vbpc_network import forward_logits
-from vbpc.posterior.weight_posterior import VBPCWeightParams, mean_weight_variance
+from vbpc.posterior.weight_posterior import (
+    VBPCWeightParams,
+    mean_weight_variance,
+    sample_weight_matrices,
+)
 
 
 def softmax(logits: Array) -> Array:
@@ -42,6 +46,68 @@ def collect_logits(
     if not chunks:
         return jnp.zeros((0, 0), dtype=DTYPE)
     return jnp.concatenate(chunks, axis=0)
+
+
+def collect_mc_probs(
+    weight_params: Tuple[VBPCWeightParams, ...],
+    x: Array,
+    key: Array,
+    cfg: VBPCConfig,
+    n_samples: int = 30,
+) -> np.ndarray:
+    """Monte Carlo posterior-predictive probabilities averaged over ``n_samples`` weight draws."""
+    keys = jax.random.split(key, n_samples)
+    pred_fn = jax.jit(lambda w, xb: jax.nn.softmax(forward_logits(w, xb, cfg), axis=-1))
+    sum_probs: np.ndarray | None = None
+    for k in keys:
+        w = sample_weight_matrices(weight_params, k, cfg.weight_sigma_min, cfg.weight_sigma_max)
+        chunks = [
+            np.asarray(pred_fn(w, x[s:s + cfg.eval_batch_size]))
+            for s in range(0, int(x.shape[0]), cfg.eval_batch_size)
+        ]
+        probs = np.concatenate(chunks, axis=0)
+        sum_probs = probs if sum_probs is None else sum_probs + probs
+    return sum_probs / n_samples  
+
+
+def mc_nll_from_probs(probs: np.ndarray, y: Array, eps: float = 1e-12) -> float:
+    labels = np.asarray(jnp.argmax(y, axis=-1))
+    picked = probs[np.arange(labels.shape[0]), labels]
+    return float(-np.mean(np.log(np.maximum(picked, eps))))
+
+
+def mc_ece_from_probs(probs: np.ndarray, y: Array, n_bins: int = 15) -> float:
+    labels = np.asarray(jnp.argmax(y, axis=-1))
+    confidence = probs.max(axis=1)
+    correct = (probs.argmax(axis=1) == labels).astype(np.float64)
+    n = confidence.shape[0]
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = edges[i], edges[i + 1]
+        mask = (confidence >= lo) & (confidence <= hi) if i == 0 else (confidence > lo) & (confidence <= hi)
+        count = int(mask.sum())
+        if count:
+            ece += (count / n) * abs(float(correct[mask].mean()) - float(confidence[mask].mean()))
+    return float(ece)
+
+
+def mc_evaluate(
+    weight_params: Tuple[VBPCWeightParams, ...],
+    x: Array,
+    y: Array,
+    key: Array,
+    cfg: VBPCConfig,
+    n_samples: int = 30,
+    n_bins: int = 15,
+) -> Dict[str, float]:
+    """MC posterior-predictive NLL, ECE and accuracy alongside the mean-weight baseline."""
+    probs = collect_mc_probs(weight_params, x, key, cfg, n_samples)
+    return {
+        "mc_nll": mc_nll_from_probs(probs, y),
+        "mc_ece": mc_ece_from_probs(probs, y, n_bins=n_bins),
+        "mc_acc": float((probs.argmax(axis=1) == np.asarray(jnp.argmax(y, axis=-1))).mean()),
+    }
 
 
 def accuracy_from_logits(logits: Array, y: Array) -> float:
