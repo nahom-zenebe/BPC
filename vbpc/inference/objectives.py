@@ -153,6 +153,28 @@ def pc_energy(
     return sum(per_layer, jnp.asarray(0.0, dtype=DTYPE))
 
 
+def latent_kl(states: VBPCStates, cfg: VBPCConfig) -> Array:
+    """Analytic ``KL[q(z) || N(0,I)]`` summed over all hidden layers.
+
+    For ``q(z_l) = N(mu_l, diag(sigma_l^2))`` the per-element KL is
+
+        0.5 * (mu_l^2 + sigma_l^2 - 1 - log sigma_l^2)
+
+    Summed or averaged over elements (matching ``cfg.kl_reduction``),
+    then summed over layers -- consistent with :func:`weight_kl`.
+    """
+
+    mode = cfg.kl_reduction
+    if mode not in ("mean", "sum"):
+        raise ValueError(f"Unknown kl_reduction={mode}")
+    total = jnp.asarray(0.0, dtype=DTYPE)
+    for mu, ls in zip(states.mu, states.log_sigma):
+        sigma = state_sigma(ls, cfg.state_sigma_min, cfg.state_sigma_max)
+        kl_elem = 0.5 * (mu ** 2 + sigma ** 2 - 1.0 - jnp.log(sigma ** 2))
+        total = total + (jnp.mean(kl_elem) if mode == "mean" else jnp.sum(kl_elem))
+    return total
+
+
 def total_vbpc_objective(
     z_states: Tuple[Array, ...],
     weights: Tuple[Array, ...],

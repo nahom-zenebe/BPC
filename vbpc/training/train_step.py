@@ -110,10 +110,22 @@ def vbpc_loss_and_grads(
     key: Array,
     beta: Optional[Array] = None,
 ) -> Tuple[Array, Tuple[Array, Array], Any, VBPCStates, VBPCLatentDiagnostics, Tuple[Array, ...], Any]:
-    """``L_total``, its two terms, gradients and the inferred latents for one batch."""
+    """``L_total``, its two terms, gradients and the inferred latents for one batch.
 
-    weights, epsilons, latents, latent_diag = sample_weights_and_latents(
-        weight_params, layer_dims, xb, yb, cfg, key
+    When ``cfg.n_weight_samples > 1``, draws that many independent weight epsilon
+    samples, averages their ``L_PC`` gradients (and values), then adds a single
+    ``L_KL`` term.  Latent inference uses the first weight sample only.
+    """
+
+    n = int(cfg.n_weight_samples)
+    # Latent inference always uses the first weight sample.
+    key_w0, key_latent, *keys_extra = jax.random.split(key, n + 2)
+    epsilons = sample_weight_epsilons(weight_params, key_w0)
+    weights = reparameterize_weight_matrices(
+        weight_params, epsilons, cfg.weight_sigma_min, cfg.weight_sigma_max
+    )
+    latents, latent_diag = vbpc_latent_inference(
+        weight_params, layer_dims, weights, xb, yb, cfg, key_latent
     )
     frozen = jax.lax.stop_gradient(latents)
     eps_states = sample_state_epsilons(frozen, jax.random.fold_in(key, 1))
@@ -125,24 +137,39 @@ def vbpc_loss_and_grads(
             cfg.prior_weight_log_sigma,
         )
 
-    def loss_fn(params):
+    def pc_loss_fn(params, eps_w):
+        """``L_PC`` for one weight epsilon sample (no KL)."""
         sampled_weights = reparameterize_weight_matrices(
-            params, epsilons, cfg.weight_sigma_min, cfg.weight_sigma_max
+            params, eps_w, cfg.weight_sigma_min, cfg.weight_sigma_max
         )
         hidden = reparameterize_states(
             frozen, eps_states, cfg.state_sigma_min, cfg.state_sigma_max
         )
-        l_pc = pc_energy(clamped_states(hidden, xb, yb), sampled_weights, cfg)
-        l_kl = kl_only(params)
-        return l_pc + beta_value * l_kl, (l_pc, l_kl)
+        return pc_energy(clamped_states(hidden, xb, yb), sampled_weights, cfg)
 
-    (total, (l_pc, l_kl)), grads = jax.value_and_grad(loss_fn, has_aux=True)(weight_params)
-    # Closed form (no extra backward pass through the PC graph), used only to
-    # report how much of the weight update the prior explains.
+    # First sample (already drawn for latent inference).
+    l_pc_0, pc_grads_0 = jax.value_and_grad(pc_loss_fn)(weight_params, epsilons)
+    l_pc_acc = l_pc_0
+    pc_grads_acc = pc_grads_0
+
+    # Additional samples averaged in.
+    for i, key_wi in enumerate(keys_extra):
+        eps_i = sample_weight_epsilons(weight_params, key_wi)
+        l_pc_i, pc_grads_i = jax.value_and_grad(pc_loss_fn)(weight_params, eps_i)
+        l_pc_acc = l_pc_acc + l_pc_i
+        pc_grads_acc = jax.tree.map(lambda a, b: a + b, pc_grads_acc, pc_grads_i)
+
+    scale = jnp.asarray(1.0 / n, dtype=DTYPE)
+    l_pc = l_pc_acc * scale
+    pc_grads = jax.tree.map(lambda g: g * scale, pc_grads_acc)
+
+    l_kl = kl_only(weight_params)
+    total = l_pc + beta_value * l_kl
     kl_grads = weight_kl_grads(
         weight_params, cfg.kl_reduction, cfg.weight_sigma_min, cfg.weight_sigma_max,
         cfg.prior_weight_log_sigma,
     )
+    grads = jax.tree.map(lambda p, k: p + beta_value * k, pc_grads, kl_grads)
     return total, (l_pc, l_kl), grads, latents, latent_diag, epsilons, kl_grads
 
 

@@ -27,6 +27,7 @@ from vbpc.config import VBPCConfig
 from vbpc.inference.objectives import (
     VBPCStates,
     clamped_states,
+    latent_kl,
     pc_energy,
     sample_states,
     state_sigma,
@@ -82,10 +83,19 @@ def latent_pc_energy(
     cfg: VBPCConfig,
     key: Array,
 ) -> Array:
-    """Single-sample reparameterized estimate of ``L_PC`` used for latent gradients."""
+    """Single-sample reparameterized estimate of the latent ELBO.
+
+    Minimizes ``L_PC + latent_kl_weight * KL[q(z) || N(0,I)]``.
+    With ``latent_kl_weight=0`` (default) this reduces to the original
+    ``L_PC``-only objective; a small positive value (e.g. ``1e-3``) prevents
+    ``sigma_l`` from collapsing to zero.
+    """
 
     hidden = sample_states(states, key, cfg.state_sigma_min, cfg.state_sigma_max)
-    return pc_energy(clamped_states(hidden, x, y), weights, cfg)
+    l_pc = pc_energy(clamped_states(hidden, x, y), weights, cfg)
+    if cfg.latent_kl_weight == 0.0:
+        return l_pc
+    return l_pc + jnp.asarray(cfg.latent_kl_weight, dtype=l_pc.dtype) * latent_kl(states, cfg)
 
 
 def deterministic_pc_energy(
