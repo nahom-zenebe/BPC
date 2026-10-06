@@ -138,8 +138,8 @@ def gaussian_kl_elementwise(
     With ``prior_log_sigma = 0`` (``tau = 1``) this is exactly the proposal's
     ``KL(q(W) || N(0, I))`` element.  Passing ``prior_log_sigma ==
     init_weight_log_sigma`` makes the prior match the initialization, so
-    ``dKL/dlog_sigma = sigma^2 - tau^2`` is zero at initialization instead of the
-    ``~ -1`` that a unit prior produces against a thin ``sigma = exp(-3)`` start.
+    ``dKL/dlog_sigma = sigma^2 / tau^2 - 1`` is zero at initialization instead of
+    the ``~ -1`` that a unit prior produces against a thin ``sigma = exp(-3)`` start.
     """
 
     tau_sq = prior_sigma(prior_log_sigma) ** 2
@@ -185,8 +185,8 @@ def weight_kl_grads(
     The KL is analytic and factorized, so its gradient is available in closed
     form and does not need a backward pass:
 
-        d/d mu       = mu / tau^2
-        d/d log_sigma = sigma^2 - tau^2
+        d/d mu        = mu / tau^2
+        d/d log_sigma = sigma^2 / tau^2 - 1
 
     each divided by the per-layer entry count for ``reduction="mean"``.  This is
     used to report how much of the weight update the prior explains; computing
@@ -209,7 +209,7 @@ def weight_kl_grads(
         out.append(
             VBPCWeightParams(
                 mu=p.mu * (scale / tau_sq),
-                log_sigma=(sigma ** 2 - tau_sq) * jnp.asarray(scale, dtype=DTYPE),
+                log_sigma=(sigma ** 2 / tau_sq - 1.0) * jnp.asarray(scale, dtype=DTYPE),
             )
         )
     return tuple(out)
