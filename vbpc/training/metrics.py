@@ -24,6 +24,7 @@ from vbpc.posterior.weight_posterior import (
     VBPCWeightParams,
     mean_weight_variance,
     sample_weight_matrices,
+    weight_sigma,
 )
 
 
@@ -67,7 +68,7 @@ def collect_mc_probs(
         ]
         probs = np.concatenate(chunks, axis=0)
         sum_probs = probs if sum_probs is None else sum_probs + probs
-    return sum_probs / n_samples  
+    return sum_probs / n_samples
 
 
 def mc_nll_from_probs(probs: np.ndarray, y: Array, eps: float = 1e-12) -> float:
@@ -92,6 +93,33 @@ def mc_ece_from_probs(probs: np.ndarray, y: Array, n_bins: int = 15) -> float:
     return float(ece)
 
 
+def predictive_entropy_from_probs(probs: np.ndarray, eps: float = 1e-12) -> float:
+    """H[p̄] = -Σ_c p̄_c log p̄_c, averaged over the dataset.
+
+    For mean-weight probs this is the entropy of the point-estimate predictive;
+    for MC-averaged probs it is the full posterior-predictive entropy.
+    """
+    return float(-np.mean(np.sum(probs * np.log(np.maximum(probs, eps)), axis=1)))
+
+
+def latent_gaussian_entropy(
+    weight_params: Tuple[VBPCWeightParams, ...],
+    cfg: VBPCConfig,
+) -> float:
+    """Analytic differential entropy of q(W) = Π_l N(mu_l, diag(sigma_l²)).
+
+    H[q] = Σ_l Σ_ij 0.5 * log(2π e σ_{l,ij}²)
+
+    This is the entropy of the *latent weight distribution*, distinct from the
+    classification NLL (cross-entropy of softmax outputs) logged elsewhere.
+    """
+    total = jnp.asarray(0.0, dtype=DTYPE)
+    for p in weight_params:
+        sigma = weight_sigma(p.log_sigma, cfg.weight_sigma_min, cfg.weight_sigma_max)
+        total = total + jnp.sum(0.5 * jnp.log(2.0 * jnp.pi * jnp.e * sigma ** 2))
+    return float(total)
+
+
 def mc_evaluate(
     weight_params: Tuple[VBPCWeightParams, ...],
     x: Array,
@@ -101,12 +129,13 @@ def mc_evaluate(
     n_samples: int = 30,
     n_bins: int = 15,
 ) -> Dict[str, float]:
-    """MC posterior-predictive NLL, ECE and accuracy alongside the mean-weight baseline."""
+    """MC posterior-predictive NLL, ECE, accuracy and predictive entropy."""
     probs = collect_mc_probs(weight_params, x, key, cfg, n_samples)
     return {
         "mc_nll": mc_nll_from_probs(probs, y),
         "mc_ece": mc_ece_from_probs(probs, y, n_bins=n_bins),
         "mc_acc": float((probs.argmax(axis=1) == np.asarray(jnp.argmax(y, axis=-1))).mean()),
+        "mc_pred_entropy": predictive_entropy_from_probs(probs),
     }
 
 
@@ -166,7 +195,7 @@ def negative_log_likelihood(
     y: Array,
     cfg: VBPCConfig,
 ) -> float:
-    """Mean ``-log p(class | x)`` with ``p = softmax(logits)``."""
+    """Mean ``-log p(class | x)`` with ``p = softmax(logits)`` (classification NLL)."""
 
     return nll_from_logits(collect_logits(weight_params, x, cfg), y)
 
@@ -199,13 +228,21 @@ def evaluate(
     cfg: VBPCConfig,
     n_bins: int = 15,
 ) -> Dict[str, float]:
-    """Accuracy, NLL and ECE from a single shared set of logits."""
+    """Accuracy, classification NLL, ECE, predictive entropy and latent Gaussian entropy.
+
+    ``nll`` is the softmax cross-entropy (classification NLL), distinct from the
+    Gaussian likelihood that underlies the ELBO training objective.
+    ``latent_entropy`` is the analytic H[q(W)] of the variational weight posterior.
+    """
 
     logits = collect_logits(weight_params, x, cfg)
+    probs = np.asarray(softmax(logits))
     return {
         "acc": accuracy_from_logits(logits, y),
         "nll": nll_from_logits(logits, y),
         "ece": ece_from_logits(logits, y, n_bins=n_bins),
+        "pred_entropy": predictive_entropy_from_probs(probs),
+        "latent_entropy": latent_gaussian_entropy(weight_params, cfg),
     }
 
 
