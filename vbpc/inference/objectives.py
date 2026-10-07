@@ -175,6 +175,45 @@ def latent_kl(states: VBPCStates, cfg: VBPCConfig) -> Array:
     return total
 
 
+def feedforward_latent_kl(
+    states: VBPCStates,
+    ff_hidden: Tuple[Array, ...],
+    cfg: VBPCConfig,
+) -> Array:
+    """Analytic ``KL[q(z_l) || p(z_l|x)]`` with ``p(z_l|x) = N(h_l, tau^2 I)``.
+
+    The feedforward reference ``h_l = h_l^ff(x)`` is the mean-weight activation
+    at layer ``l``, pre-computed by the caller.  Whether gradients flow through
+    ``h_l`` into ``mu_W`` is controlled by the caller via
+    ``jax.lax.stop_gradient`` before passing ``ff_hidden`` here.
+
+    KL per element (standard Gaussian KL with non-zero prior mean ``h_l`` and
+    prior variance ``tau^2``):
+
+        KL = 0.5 * [ (mu_l - h_l)^2 / tau^2  +  sigma_l^2 / tau^2
+                     - 1  -  log(sigma_l^2 / tau^2) ]
+
+    Reduction over elements matches ``cfg.kl_reduction``; result is summed over
+    layers -- consistent with :func:`latent_kl` and :func:`weight_kl`.
+    """
+    mode = cfg.kl_reduction
+    if mode not in ("mean", "sum"):
+        raise ValueError(f"Unknown kl_reduction={mode}")
+    tau_sq = jnp.asarray(cfg.latent_prior_tau ** 2, dtype=DTYPE)
+    log_tau_sq = jnp.log(tau_sq)
+    total = jnp.asarray(0.0, dtype=DTYPE)
+    for mu, ls, h in zip(states.mu, states.log_sigma, ff_hidden):
+        sigma = state_sigma(ls, cfg.state_sigma_min, cfg.state_sigma_max)
+        kl_elem = 0.5 * (
+            (mu - h) ** 2 / tau_sq
+            + sigma ** 2 / tau_sq
+            - 1.0
+            - (jnp.log(sigma ** 2) - log_tau_sq)
+        )
+        total = total + (jnp.mean(kl_elem) if mode == "mean" else jnp.sum(kl_elem))
+    return total
+
+
 def total_vbpc_objective(
     z_states: Tuple[Array, ...],
     weights: Tuple[Array, ...],

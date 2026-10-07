@@ -166,7 +166,30 @@ class VBPCConfig:
     #: ``L_PC`` alone drives the latent optimizer, which collapses ``sigma_l``
     #: downward with no floor.  A small value (e.g. ``1e-3``) prevents collapse
     #: without meaningfully changing the inferred means.
+    #: Ignored when ``latent_prior_tau > 0`` (the feedforward prior subsumes this).
     latent_kl_weight: float = 0.0
+    #: Standard deviation ``tau_l`` of the data-dependent latent prior
+    #: ``p(z_l | x) = N(h_l^ff(x), tau_l^2 I)`` where ``h_l^ff(x)`` is the
+    #: mean-weight feedforward activation at layer ``l``.  ``0.0`` (default)
+    #: keeps the original isotropic ``N(0, I)`` prior and ``latent_kl_weight``
+    #: path.  Any positive value activates the feedforward-centered prior and
+    #: replaces ``latent_kl_weight`` entirely during latent inference.
+    #:
+    #: Hierarchical interpretation: the feedforward pass defines a
+    #: *recognition-network prior* -- the mean-weight network's prediction of
+    #: where each hidden layer should sit given ``x``.  The KL then penalizes
+    #: how far the inferred ``q(z_l)`` drifts from that prediction, with
+    #: ``tau_l`` controlling the tightness.  Small ``tau_l`` (e.g. ``0.1``)
+    #: keeps latents close to the feedforward trajectory; large ``tau_l``
+    #: (e.g. ``1.0``) allows free inference as in the original model.
+    latent_prior_tau: float = 0.0
+    #: If ``True`` (default), the feedforward reference ``h_l^ff(x)`` is
+    #: detached from the weight-parameter graph during latent inference.
+    #: This preserves the phase separation: the latent optimizer sees ``h_l``
+    #: as a fixed anchor and does not propagate gradients back into ``mu_W``.
+    #: Set to ``False`` to allow ``mu_W`` to be pulled toward ``mu_l`` via the
+    #: KL -- a valid but different model that couples the two phases.
+    latent_prior_stop_grad: bool = True
     #: Number of independent weight epsilon samples whose ``L_PC`` gradients are
     #: averaged before the Adam weight update.  ``1`` (default) is the original
     #: single-sample estimator; ``2``–``4`` reduces gradient variance at the cost
@@ -213,6 +236,8 @@ def validate_vbpc_config(cfg: VBPCConfig) -> None:
         raise ValueError("state_sigma_min/max must be positive and increasing.")
     if cfg.latent_kl_weight < 0.0:
         raise ValueError(f"latent_kl_weight must be non-negative, got {cfg.latent_kl_weight}")
+    if cfg.latent_prior_tau < 0.0:
+        raise ValueError(f"latent_prior_tau must be non-negative, got {cfg.latent_prior_tau}")
     if cfg.n_weight_samples < 1:
         raise ValueError(f"n_weight_samples must be >= 1, got {cfg.n_weight_samples}")
 
@@ -266,5 +291,57 @@ def make_vbpc_presets() -> Dict[str, VBPCConfig]:
             latent_steps=20,
             latent_kl_weight=1e-3,
             n_weight_samples=2,
+        ),
+        # --- feedforward-prior experiment presets ---
+        # Tight prior (tau=0.1): latents stay close to the mean-weight trajectory.
+        # Useful for measuring how much free latent inference helps over a pure
+        # feedforward pass.  Stop-grad on h_l (default) keeps phase separation.
+        "vbpc_two_moons_ff_prior_tight": replace(
+            base,
+            name="vbpc_two_moons_ff_prior_tight",
+            epochs=VBPC_TWO_MOONS_EPOCHS,
+            hidden=VBPC_TWO_MOONS_HIDDEN,
+            hidden_layers=1,
+            batch_size=VBPC_TWO_MOONS_BATCH_SIZE,
+            beta=0.01,
+            prior_weight_log_sigma=VBPC_INIT_WEIGHT_LOG_SIGMA,
+            latent_steps=20,
+            n_weight_samples=2,
+            latent_prior_tau=0.1,
+            latent_prior_stop_grad=True,
+        ),
+        # Loose prior (tau=1.0): nearly as free as the original N(0,I) prior but
+        # centered on the feedforward states.  Compare against vbpc_two_moons to
+        # isolate the effect of the prior center vs. the prior width.
+        "vbpc_two_moons_ff_prior_loose": replace(
+            base,
+            name="vbpc_two_moons_ff_prior_loose",
+            epochs=VBPC_TWO_MOONS_EPOCHS,
+            hidden=VBPC_TWO_MOONS_HIDDEN,
+            hidden_layers=1,
+            batch_size=VBPC_TWO_MOONS_BATCH_SIZE,
+            beta=0.01,
+            prior_weight_log_sigma=VBPC_INIT_WEIGHT_LOG_SIGMA,
+            latent_steps=20,
+            n_weight_samples=2,
+            latent_prior_tau=1.0,
+            latent_prior_stop_grad=True,
+        ),
+        # Coupled variant (stop_grad=False): mu_W is pulled toward mu_l via the
+        # KL.  Different model -- run alongside the stop-grad version to measure
+        # the cross-phase coupling effect.
+        "vbpc_two_moons_ff_prior_coupled": replace(
+            base,
+            name="vbpc_two_moons_ff_prior_coupled",
+            epochs=VBPC_TWO_MOONS_EPOCHS,
+            hidden=VBPC_TWO_MOONS_HIDDEN,
+            hidden_layers=1,
+            batch_size=VBPC_TWO_MOONS_BATCH_SIZE,
+            beta=0.01,
+            prior_weight_log_sigma=VBPC_INIT_WEIGHT_LOG_SIGMA,
+            latent_steps=20,
+            n_weight_samples=2,
+            latent_prior_tau=0.3,
+            latent_prior_stop_grad=False,
         ),
     }

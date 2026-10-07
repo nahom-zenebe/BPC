@@ -27,6 +27,7 @@ from vbpc.config import VBPCConfig
 from vbpc.inference.objectives import (
     VBPCStates,
     clamped_states,
+    feedforward_latent_kl,
     latent_kl,
     pc_energy,
     sample_states,
@@ -82,17 +83,30 @@ def latent_pc_energy(
     y: Array,
     cfg: VBPCConfig,
     key: Array,
+    ff_hidden: Tuple[Array, ...] = (),
 ) -> Array:
-    """Single-sample reparameterized estimate of the latent ELBO.
+    """Single-sample reparameterized estimate of the latent objective.
 
-    Minimizes ``L_PC + latent_kl_weight * KL[q(z) || N(0,I)]``.
-    With ``latent_kl_weight=0`` (default) this reduces to the original
-    ``L_PC``-only objective; a small positive value (e.g. ``1e-3``) prevents
-    ``sigma_l`` from collapsing to zero.
+    Three regimes controlled by config:
+
+    * ``latent_prior_tau > 0``: minimizes
+      ``L_PC + latent_kl_weight * KL[q(z) || N(h_l^ff(x), tau^2 I)]``.
+      ``ff_hidden`` must be provided (pre-computed by the caller so the
+      feedforward pass is not repeated inside the scan body).
+      Whether ``h_l`` carries gradients into ``mu_W`` is decided by the
+      caller via ``latent_prior_stop_grad`` before passing ``ff_hidden``.
+
+    * ``latent_kl_weight > 0`` (original fallback): minimizes
+      ``L_PC + latent_kl_weight * KL[q(z) || N(0, I)]``.
+
+    * Both zero (default): minimizes ``L_PC`` only.
     """
-
     hidden = sample_states(states, key, cfg.state_sigma_min, cfg.state_sigma_max)
     l_pc = pc_energy(clamped_states(hidden, x, y), weights, cfg)
+    if cfg.latent_prior_tau > 0.0:
+        return l_pc + jnp.asarray(cfg.latent_kl_weight, dtype=l_pc.dtype) * feedforward_latent_kl(
+            states, ff_hidden, cfg
+        )
     if cfg.latent_kl_weight == 0.0:
         return l_pc
     return l_pc + jnp.asarray(cfg.latent_kl_weight, dtype=l_pc.dtype) * latent_kl(states, cfg)
@@ -127,6 +141,17 @@ def vbpc_latent_inference(
     n_states = max(len(weights) - 1, 0)
 
     states = init_vbpc_latents(weight_params, layer_dims, x, cfg)
+
+    # Pre-compute the feedforward reference once per inference phase.
+    # stop_gradient keeps the latent optimizer from writing gradients back into
+    # mu_W through h_l; without it the two optimization phases are coupled.
+    if cfg.latent_prior_tau > 0.0:
+        ff_hidden: Tuple[Array, ...] = forward_hidden(weight_params, layer_dims, x, cfg)
+        if cfg.latent_prior_stop_grad:
+            ff_hidden = tuple(jax.lax.stop_gradient(h) for h in ff_hidden)
+    else:
+        ff_hidden = ()
+
     optimizer = make_optimizer(cfg.latent_lr)
     opt_state = optimizer.init(states)
 
@@ -140,7 +165,7 @@ def vbpc_latent_inference(
     def body(carry, i):
         states, opt_state, key, e_log, em_log, g_log, gl_log, z_log, s_log = carry
         key, sub = jax.random.split(key)
-        energy, grads = jax.value_and_grad(latent_pc_energy)(states, weights, x, y, cfg, sub)
+        energy, grads = jax.value_and_grad(latent_pc_energy)(states, weights, x, y, cfg, sub, ff_hidden)
         e_log = e_log.at[i].set(energy)
         # Reuse the stochastic energy as the mean-energy diagnostic to avoid a
         # second full forward pass through the network on every latent step.
