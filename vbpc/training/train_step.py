@@ -119,7 +119,7 @@ def vbpc_loss_and_grads(
 
     n = int(cfg.n_weight_samples)
     # Latent inference always uses the first weight sample.
-    key_w0, key_latent, *keys_extra = jax.random.split(key, n + 2)
+    key_w0, key_latent, *keys_extra = jax.random.split(key, n + 1)
     epsilons = sample_weight_epsilons(weight_params, key_w0)
     weights = reparameterize_weight_matrices(
         weight_params, epsilons, cfg.weight_sigma_min, cfg.weight_sigma_max

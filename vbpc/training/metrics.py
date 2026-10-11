@@ -17,7 +17,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from bpc.activations import activation
 from bpc.config import DTYPE, Array
+from bpc.utils.tensor_ops import augment
 from vbpc.config import VBPCConfig
 from vbpc.layers.vbpc_network import forward_logits
 from vbpc.posterior.weight_posterior import (
@@ -49,6 +51,18 @@ def collect_logits(
     return jnp.concatenate(chunks, axis=0)
 
 
+def _forward_logits_raw(
+    weights: Tuple[Array, ...],
+    x: Array,
+    cfg: VBPCConfig,
+) -> Array:
+    """Forward pass with raw weight matrices (no ``.mu`` indirection)."""
+    z = x
+    for l, W in enumerate(weights):
+        z = augment(activation(z, l, cfg.input_activation)) @ W.T
+    return z / jnp.asarray(cfg.error_variance, dtype=x.dtype)
+
+
 def collect_mc_probs(
     weight_params: Tuple[VBPCWeightParams, ...],
     x: Array,
@@ -58,7 +72,7 @@ def collect_mc_probs(
 ) -> np.ndarray:
     """Monte Carlo posterior-predictive probabilities averaged over ``n_samples`` weight draws."""
     keys = jax.random.split(key, n_samples)
-    pred_fn = jax.jit(lambda w, xb: jax.nn.softmax(forward_logits(w, xb, cfg), axis=-1))
+    pred_fn = jax.jit(lambda w, xb: jax.nn.softmax(_forward_logits_raw(w, xb, cfg), axis=-1))
     sum_probs: np.ndarray | None = None
     for k in keys:
         w = sample_weight_matrices(weight_params, k, cfg.weight_sigma_min, cfg.weight_sigma_max)
