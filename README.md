@@ -112,6 +112,45 @@ Two-moons runs are namespaced separately from MNIST: logs go to
 comparison figure.
 
 
+## Latent-Prior Ablation Study
+
+The ablation isolates the effect of the latent KL term by holding every other
+training setting fixed and varying only the prior placed on the hidden states:
+
+| Condition | Latent objective |
+|---|---|
+| `no_latent_kl` | `L_PC` only — no KL on latents (original VBPC behaviour) |
+| `standard_normal` | `L_PC + λ · KL[q(z_l) \|\| N(0, τ²I)]` |
+| `ff_centered` | `L_PC + λ · KL[q(z_l) \|\| N(h_l^ff(x), τ²I)]` |
+
+The KL coefficient `λ` (`latent_kl_weight`) and prior variance `τ²`
+(`latent_prior_tau`) are **identical** between `standard_normal` and
+`ff_centered` — the only axis of variation is the prior *center* (zero vs.
+the mean-weight feedforward activation at layer `l`).  All other settings
+(architecture, `beta`, weight prior, optimizer hyperparameters, epochs) are
+fixed across conditions and seeds.  The shared values are defined as
+`ABLATION_LATENT_KL_WEIGHT` and `ABLATION_LATENT_TAU` in `vbpc/config.py`.
+
+Run the ablation (default: 3 seeds × 3 conditions = 9 runs):
+
+```bash
+python -m experiments.latent_prior_ablation --config configs/latent_prior_ablation.yaml
+python -m experiments.latent_prior_ablation --seeds 0,1,2,3,4
+```
+
+Each run logs to `runs/vbpc_mnist/<config>/<timestamp>/epoch.csv` in the
+standard VBPC format.  After all runs complete, the script writes:
+
+- `runs/latent_prior_ablation.json` — per-run rows plus a `"aggregate"` block
+  with `mean ± std` of accuracy, NLL and ECE for each condition.
+- `runs/latent_prior_ablation.png` — bar chart of the three metrics across
+  conditions with error bars.
+
+The three ablation presets (`ablation_no_latent_kl`, `ablation_standard_normal`,
+`ablation_ff_centered`) are available in `vbpc/config.py` and can be used
+directly with the existing `vbpc_mnist` entry point for single-condition runs.
+
+
 ## Test
 
 ```bash

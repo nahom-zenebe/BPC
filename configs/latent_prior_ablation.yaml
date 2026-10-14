@@ -1,0 +1,26 @@
+# Latent-prior ablation study on MNIST.
+#
+# Three conditions, all other settings fixed:
+#   no_latent_kl   : no KL on latent states (original VBPC behaviour)
+#   standard_normal: KL[q(z_l) || N(0, tau^2 I)]
+#   ff_centered    : KL[q(z_l) || N(h_l^ff(x), tau^2 I)]
+#
+# latent_kl_weight and latent_prior_tau are matched between the two prior
+# variants (taken from the ablation_standard_normal / ablation_ff_centered
+# presets in vbpc/config.py).  All other training settings are inherited
+# from the ablation_no_latent_kl preset (same architecture, beta, weight
+# prior, optimizer hyperparameters, epochs).
+#
+# Usage:
+#   python -m experiments.latent_prior_ablation --config configs/latent_prior_ablation.yaml
+#   python -m experiments.latent_prior_ablation --seeds 0,1,2,3,4
+
+preset: ablation_no_latent_kl
+config:
+  name: latent_prior_ablation
+logging:
+  save_dir: runs
+seeds:
+  - 0
+  - 1
+  - 2

@@ -350,3 +350,162 @@ def train_vbpc_two_moons_dataset(
     """Train VBPC on a two-moons dataset (same loop, ``vbpc_two_moons`` namespace)."""
 
     return train_vbpc_mnist_dataset(cfg, data, layer_dims, lcfg, mode="vbpc_two_moons")
+
+
+# ---------------------------------------------------------------------------
+# Latent-prior ablation study
+# ---------------------------------------------------------------------------
+
+#: The three conditions of the latent-prior ablation, in display order.
+LATENT_PRIOR_CONDITIONS = ("no_latent_kl", "standard_normal", "ff_centered")
+
+
+def run_latent_prior_ablation(
+    cfg: Optional[VBPCConfig] = None,
+    data: Optional[MNDataset] = None,
+    layer_dims: Optional[Tuple[int, ...]] = None,
+    lcfg: Optional[LoggingConfig] = None,
+    seeds: Tuple[int, ...] = (0, 1, 2),
+    mode: str = "vbpc_mnist",
+    summary_name: str = "latent_prior_ablation",
+) -> List[Dict[str, object]]:
+    """Run the three-condition latent-prior ablation across multiple seeds.
+
+    Conditions
+    ----------
+    no_latent_kl
+        No KL term on the latent states.  ``L_PC`` alone drives latent
+        inference (original VBPC behaviour).
+    standard_normal
+        ``KL[q(z_l) || N(0, tau^2 I)]`` added to the latent objective with
+        coefficient ``latent_kl_weight``.
+    ff_centered
+        ``KL[q(z_l) || N(h_l^ff(x), tau^2 I)]`` with the *same*
+        ``latent_kl_weight`` and ``tau`` as the ``standard_normal`` condition.
+        The only difference is the prior center: zero vs. the mean-weight
+        feedforward activation.
+
+    The KL coefficient (``latent_kl_weight``) and prior variance (``tau^2``)
+    are taken from the preset ``ablation_standard_normal`` / ``ablation_ff_centered``
+    and are therefore guaranteed to be identical between the two prior variants.
+    All other training settings (architecture, ``beta``, weight prior, optimizer
+    hyperparameters, number of epochs) are fixed across conditions and seeds.
+
+    Each (condition, seed) pair is an independent run.  The summary JSON
+    ``<save_dir>/<summary_name>.json`` collects accuracy, NLL and entropy for
+    every run so downstream analysis can compute means and standard deviations.
+    """
+    from vbpc.config import make_vbpc_presets
+
+    presets = make_vbpc_presets()
+    base_cfg = cfg if cfg is not None else default_vbpc_config()
+    data_loaded = data if data is not None else load_mnist(base_cfg)
+    dims = tuple(layer_dims) if layer_dims is not None else build_mnist_dims(base_cfg)
+    active_lcfg = lcfg if lcfg is not None else LOGGING
+    save_dir = active_lcfg.save_dir or SAVE_DIR
+    os.makedirs(save_dir, exist_ok=True)
+
+    condition_cfgs = {
+        "no_latent_kl": presets["ablation_no_latent_kl"],
+        "standard_normal": presets["ablation_standard_normal"],
+        "ff_centered": presets["ablation_ff_centered"],
+    }
+
+    summary: List[Dict[str, object]] = []
+    for condition in LATENT_PRIOR_CONDITIONS:
+        cond_cfg = condition_cfgs[condition]
+        for seed in seeds:
+            run_cfg = replace(cond_cfg, seed=int(seed), name=f"{cond_cfg.name}_seed{seed}")
+            _, metrics, _ = train_vbpc_mnist_dataset(
+                run_cfg, data_loaded, dims, active_lcfg, mode=mode
+            )
+            entry: Dict[str, object] = {
+                "condition": condition,
+                "seed": int(seed),
+                "name": run_cfg.name,
+                "latent_kl_weight": float(run_cfg.latent_kl_weight),
+                "latent_prior_tau": float(run_cfg.latent_prior_tau),
+                "best_acc": metrics["best_acc"],
+                "final_acc": metrics["final_acc"],
+                "final_nll": metrics["final_nll"],
+                "final_ece": metrics["final_ece"],
+                "mean_weight_variance": metrics["mean_weight_variance"],
+                "runtime_sec": metrics["runtime_sec"],
+            }
+            summary.append(entry)
+            print(
+                f"[ablation] condition={condition} seed={seed}: "
+                f"best_acc={metrics['best_acc'] * 100:.2f}% "
+                f"nll={metrics['final_nll']:.4f} "
+                f"ece={metrics['final_ece']:.4f}"
+            )
+
+    # Aggregate mean ± std per condition.
+    agg: Dict[str, Dict[str, object]] = {}
+    for condition in LATENT_PRIOR_CONDITIONS:
+        rows = [r for r in summary if r["condition"] == condition]
+        for metric in ("best_acc", "final_nll", "final_ece"):
+            vals = [float(r[metric]) for r in rows]  # type: ignore[arg-type]
+            mean = float(np.mean(vals))
+            std = float(np.std(vals))
+            agg.setdefault(condition, {})[f"{metric}_mean"] = mean
+            agg.setdefault(condition, {})[f"{metric}_std"] = std
+        print(
+            f"[ablation] {condition}: "
+            f"acc={agg[condition]['best_acc_mean'] * 100:.2f}±{agg[condition]['best_acc_std'] * 100:.2f}% "
+            f"nll={agg[condition]['final_nll_mean']:.4f}±{agg[condition]['final_nll_std']:.4f} "
+            f"ece={agg[condition]['final_ece_mean']:.4f}±{agg[condition]['final_ece_std']:.4f}"
+        )
+
+    output = {"runs": summary, "aggregate": agg}
+    json_path = os.path.join(save_dir, f"{summary_name}.json")
+    try:
+        with open(json_path, "w") as f:
+            json.dump(output, f, indent=2, default=str)
+        print("Ablation summary:", json_path)
+    except Exception as e:  # pragma: no cover - IO guard
+        print(f"Ablation summary write failed: {e}")
+
+    _plot_ablation(agg, save_dir, summary_name, active_lcfg.plot_dpi)
+    return summary
+
+
+def _plot_ablation(
+    agg: Dict[str, Dict[str, object]],
+    out_dir: str,
+    name: str,
+    dpi: int = 160,
+) -> None:
+    """Bar chart of mean ± std for accuracy, NLL and ECE across ablation conditions."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:  
+        print(f"[ablation] plot import failed: {e}")
+        return
+    try:
+        conditions = list(agg.keys())
+        x = np.arange(len(conditions))
+        metrics = [
+            ("best_acc", "best accuracy", lambda v: v * 100, "%"),
+            ("final_nll", "final NLL", lambda v: v, ""),
+            ("final_ece", "final ECE", lambda v: v, ""),
+        ]
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        for ax, (key, label, scale, unit) in zip(axes, metrics):
+            means = [scale(float(agg[c][f"{key}_mean"])) for c in conditions]
+            stds = [scale(float(agg[c][f"{key}_std"])) for c in conditions]
+            ax.bar(x, means, yerr=stds, capsize=5)
+            ax.set_xticks(x)
+            ax.set_xticklabels(conditions, rotation=15, ha="right")
+            ax.set_ylabel(f"{label}{' (' + unit + ')' if unit else ''}")
+            ax.grid(True, alpha=0.3)
+        fig.suptitle(name)
+        fig.tight_layout()
+        path = os.path.join(out_dir, f"{name}.png")
+        fig.savefig(path, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        print("Ablation plot:", path)
+    except Exception as e: 
+        print(f"[ablation] plot failed: {e}")

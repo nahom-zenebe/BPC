@@ -247,6 +247,17 @@ _NORMALIZATIONS = ("zero_one", "standardize_pixel", "standardize_scalar", "cente
 
 
 
+#: KL coefficient shared by the ``standard_normal`` and ``ff_centered`` ablation
+#: conditions.  Must be identical between the two so the only axis of variation
+#: is the prior *center* (zero vs. feedforward activation).
+ABLATION_LATENT_KL_WEIGHT: float = 1e-3
+
+#: Prior standard deviation ``tau`` shared by the ``standard_normal`` and
+#: ``ff_centered`` ablation conditions.  ``standard_normal`` uses
+#: ``N(0, tau^2 I)``; ``ff_centered`` uses ``N(h_l^ff, tau^2 I)``.
+ABLATION_LATENT_TAU: float = 1.0
+
+
 def make_vbpc_presets() -> Dict[str, VBPCConfig]:
     """Named VBPC presets, mirroring :func:`bpc.config.make_presets`."""
 
@@ -346,5 +357,53 @@ def make_vbpc_presets() -> Dict[str, VBPCConfig]:
             n_weight_samples=2,
             latent_prior_tau=0.3,
             latent_prior_stop_grad=False,
+        ),
+        # --- latent-prior ablation presets (MNIST) ---
+        # All three share the same architecture, beta, weight prior, and training
+        # settings.  The only axis of variation is the latent KL term:
+        #
+        #   no_latent_kl   : no KL on latents (original behaviour)
+        #   standard_normal: KL[q(z_l) || N(0, tau^2 I)], tau = ABLATION_LATENT_TAU
+        #   ff_centered    : KL[q(z_l) || N(h_l^ff, tau^2 I)], same tau
+        #
+        # latent_kl_weight and latent_prior_tau are matched between the two prior
+        # variants so the only difference is the prior *center* (zero vs. the
+        # mean-weight feedforward activation).
+        "ablation_no_latent_kl": replace(
+            base,
+            name="ablation_no_latent_kl",
+            epochs=VBPC_MNIST_EPOCHS,
+            hidden=HIDDEN,
+            hidden_layers=2,
+            normalize="zero_one",
+            beta=0.01,
+            prior_weight_log_sigma=VBPC_INIT_WEIGHT_LOG_SIGMA,
+            latent_kl_weight=0.0,
+            latent_prior_tau=0.0,
+        ),
+        "ablation_standard_normal": replace(
+            base,
+            name="ablation_standard_normal",
+            epochs=VBPC_MNIST_EPOCHS,
+            hidden=HIDDEN,
+            hidden_layers=2,
+            normalize="zero_one",
+            beta=0.01,
+            prior_weight_log_sigma=VBPC_INIT_WEIGHT_LOG_SIGMA,
+            latent_kl_weight=ABLATION_LATENT_KL_WEIGHT,
+            latent_prior_tau=0.0,
+        ),
+        "ablation_ff_centered": replace(
+            base,
+            name="ablation_ff_centered",
+            epochs=VBPC_MNIST_EPOCHS,
+            hidden=HIDDEN,
+            hidden_layers=2,
+            normalize="zero_one",
+            beta=0.01,
+            prior_weight_log_sigma=VBPC_INIT_WEIGHT_LOG_SIGMA,
+            latent_kl_weight=ABLATION_LATENT_KL_WEIGHT,
+            latent_prior_tau=ABLATION_LATENT_TAU,
+            latent_prior_stop_grad=True,
         ),
     }
