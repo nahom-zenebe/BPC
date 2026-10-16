@@ -119,7 +119,19 @@ def vbpc_loss_and_grads(
 
     n = int(cfg.n_weight_samples)
     # Latent inference always uses the first weight sample.
-    key_w0, key_latent, *keys_extra = jax.random.split(key, n + 1)
+    #
+    # The split count is deliberately ``n + 2``, not ``n + 1``: this is the
+    # exact estimator of the verified-good VBPC baseline (the runs that reach
+    # 85-91% MNIST accuracy and ~90% two-moons).  It yields ``n + 1`` weight
+    # epsilon samples for the ``L_PC`` average scaled by ``1/n``.  Reducing the
+    # split to ``n + 1`` (a "correct" sample count) was tried in 9c8ce1c and
+    # silently regressed training: with a single ``L_PC`` sample the data-term
+    # gradient is too weak/noisy relative to ``beta * dL_KL/dmu`` (the matched
+    # prior still pulls mu toward zero with strength ``beta * mu / tau^2``,
+    # ``tau = exp(-3)``), so the weight means collapse to zero, predictions go
+    # uniform and the NLL stalls at ln(10) ~= 2.303.  Keep this bit-compatible
+    # with the original implementation; see tests/test_latent_prior_ablation.py.
+    key_w0, key_latent, *keys_extra = jax.random.split(key, n + 2)
     epsilons = sample_weight_epsilons(weight_params, key_w0)
     weights = reparameterize_weight_matrices(
         weight_params, epsilons, cfg.weight_sigma_min, cfg.weight_sigma_max
